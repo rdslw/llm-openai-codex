@@ -1,7 +1,9 @@
 import base64
 import json
 import os
+from pathlib import Path
 import time
+from datetime import datetime, timezone
 import urllib.request
 import urllib.error
 from enum import Enum
@@ -14,32 +16,32 @@ import openai
 from pydantic import ConfigDict, Field, create_model
 
 
-# --- Vendored borrow_codex_key ---
+# --- Plugin-owned Codex auth ---
 
 REFRESH_URL = "https://auth.openai.com/oauth/token"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 REFRESH_SKEW_SECONDS = 30
 CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
+AUTH_MISSING_MESSAGE = (
+    "No llm-openai-codex auth found. Run `llm codex login` or `llm codex import`."
+)
 
 
 class BorrowKeyError(Exception):
     pass
 
 
-def borrow_codex_key():
+def get_codex_key():
     """
-    Return (access_token, account_id) borrowed from the local Codex CLI
-    ChatGPT OAuth credentials. Automatically refreshes if the access_token
-    is expired or near-expiry.
+    Return (access_token, account_id) from plugin-owned ChatGPT OAuth
+    credentials, refreshing the access token when it is expired or near-expiry.
     """
     auth_path = _auth_path()
     data = _read_auth(auth_path)
 
     tokens = data.get("tokens")
     if not tokens or not tokens.get("access_token"):
-        raise BorrowKeyError(
-            "No ChatGPT tokens found in auth.json. Run `codex login` first."
-        )
+        raise BorrowKeyError(AUTH_MISSING_MESSAGE)
 
     _ensure_account_id(data, persist_path=auth_path)
 
@@ -53,39 +55,37 @@ def borrow_codex_key():
     refresh_token = tokens.get("refresh_token")
     if not refresh_token:
         raise BorrowKeyError(
-            "No refresh token available. Run `codex login` to re-authenticate."
+            "No refresh token available. Run `llm codex login` to re-authenticate."
         )
 
-    new_tokens = _refresh(refresh_token)
-
-    if new_tokens.get("access_token"):
-        tokens["access_token"] = new_tokens["access_token"]
-    if new_tokens.get("id_token"):
-        tokens["id_token"] = new_tokens["id_token"]
-    if new_tokens.get("refresh_token"):
-        tokens["refresh_token"] = new_tokens["refresh_token"]
-
-    data["tokens"] = tokens
-    data["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
-    _ensure_account_id(data)
-
-    _write_auth(auth_path, data)
+    _refresh_auth(data, auth_path)
 
     return tokens["access_token"], tokens.get("account_id")
 
 
+# Backwards-compatible alias for callers that imported the old helper.
+borrow_codex_key = get_codex_key
+
+
 def _auth_path():
-    codex_home = os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex"))
-    path = os.path.join(codex_home, "auth.json")
-    if not os.path.exists(path):
-        raise BorrowKeyError(
-            f"Codex auth file not found at {path}. Run `codex login` first."
-        )
-    return path
+    override = os.environ.get("LLM_OPENAI_CODEX_AUTH_FILE")
+    if override:
+        return Path(override)
+    return llm.user_dir() / "auth-codex.json"
+
+
+def _codex_cli_auth_path():
+    codex_home = os.environ.get("CODEX_HOME")
+    if codex_home:
+        return Path(codex_home) / "auth.json"
+    return Path.home() / ".codex" / "auth.json"
 
 
 def _read_auth(path):
-    with open(path) as f:
+    path = Path(path)
+    if not path.exists():
+        raise BorrowKeyError(AUTH_MISSING_MESSAGE)
+    with path.open() as f:
         data = json.load(f)
     if data.get("auth_mode") != "chatgpt":
         raise BorrowKeyError(
@@ -96,9 +96,17 @@ def _read_auth(path):
 
 
 def _write_auth(path, data):
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
+    path = Path(path)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w") as f:
         json.dump(data, f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
     os.replace(tmp, path)
     os.chmod(path, 0o600)
 
@@ -159,6 +167,21 @@ def _ensure_account_id(data, persist_path=None):
     return account_id
 
 
+def _now_iso():
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _normalize_auth_data(tokens, login_type):
+    data = {
+        "auth_mode": "chatgpt",
+        "login_type": login_type,
+        "tokens": tokens,
+        "last_refresh": _now_iso(),
+    }
+    _ensure_account_id(data)
+    return data
+
+
 def _refresh(refresh_token):
     body = json.dumps(
         {
@@ -192,7 +215,7 @@ def _refresh(refresh_token):
         ):
             raise BorrowKeyError(
                 f"Refresh token is no longer valid ({error_code}). "
-                "Run `codex login` to re-authenticate."
+                "Run `llm codex login` to re-authenticate."
             ) from None
 
         raise BorrowKeyError(
@@ -200,6 +223,37 @@ def _refresh(refresh_token):
         ) from None
     except urllib.error.URLError as e:
         raise BorrowKeyError(f"Token refresh failed (network error): {e}") from None
+
+
+def _refresh_auth(data, auth_path=None):
+    tokens = data.get("tokens") or {}
+    refresh_token = tokens.get("refresh_token")
+    if not refresh_token:
+        raise BorrowKeyError(
+            "No refresh token available. Run `llm codex login` to re-authenticate."
+        )
+    new_tokens = _refresh(refresh_token)
+    for token_key in ("access_token", "id_token", "refresh_token"):
+        if new_tokens.get(token_key):
+            tokens[token_key] = new_tokens[token_key]
+    data["tokens"] = tokens
+    data["last_refresh"] = _now_iso()
+    _ensure_account_id(data)
+    if auth_path is not None:
+        _write_auth(auth_path, data)
+    return data
+
+
+def _import_codex_auth(path=None):
+    source_path = Path(path) if path else _codex_cli_auth_path()
+    data = _read_auth(source_path)
+    tokens = dict(data.get("tokens") or {})
+    if not tokens.get("access_token"):
+        raise BorrowKeyError(f"No access token found in {source_path}.")
+    plugin_data = _normalize_auth_data(tokens, "import")
+    auth_path = _auth_path()
+    _write_auth(auth_path, plugin_data)
+    return auth_path, plugin_data
 
 
 # --- Fetch available models from the Codex endpoint ---
@@ -217,7 +271,7 @@ def _fetch_codex_models():
     Returns a list of model slug strings. Falls back to DEFAULT_MODELS on error.
     """
     try:
-        token, account_id = borrow_codex_key()
+        token, account_id = get_codex_key()
     except BorrowKeyError:
         return DEFAULT_MODELS
 
@@ -292,7 +346,7 @@ class CodexOptions(Options):
 
 
 class _SharedCodexResponses:
-    needs_key = None  # We get the key from borrow_codex_key
+    needs_key = None  # We get the key from plugin-owned Codex auth
 
     def __init__(self, model_name):
         self.model_id = "codex/" + model_name
@@ -312,7 +366,7 @@ class _SharedCodexResponses:
         return f"OpenAI Codex: {self.model_id}"
 
     def _get_client_kwargs(self):
-        token, account_id = borrow_codex_key()
+        token, account_id = get_codex_key()
         headers = {}
         if account_id:
             headers["ChatGPT-Account-ID"] = account_id

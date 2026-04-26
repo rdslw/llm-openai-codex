@@ -1,18 +1,24 @@
 import base64
 import json
+import stat
+import time
 from unittest.mock import patch
 
 import llm
 import pytest
 
 from llm_openai_codex import (
+    AUTH_MISSING_MESSAGE,
     BorrowKeyError,
     CodexResponsesModel,
     DEFAULT_MODELS,
     _account_id_from_token,
+    _auth_path,
     _ensure_account_id,
     _fetch_codex_models,
+    _import_codex_auth,
     _read_auth,
+    _refresh_auth,
     _write_auth,
 )
 
@@ -20,6 +26,13 @@ from llm_openai_codex import (
 def jwt(payload):
     body = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
     return f"header.{body}.signature"
+
+
+@pytest.fixture
+def auth_file(tmp_path, monkeypatch):
+    path = tmp_path / "auth-codex.json"
+    monkeypatch.setenv("LLM_OPENAI_CODEX_AUTH_FILE", str(path))
+    return path
 
 
 def test_plugin_is_installed():
@@ -115,11 +128,26 @@ def test_build_kwargs_forwards_extra_options():
 
 def test_fetch_codex_models_fallback():
     with patch(
-        "llm_openai_codex.borrow_codex_key",
+        "llm_openai_codex.get_codex_key",
         side_effect=BorrowKeyError("no auth"),
     ):
         models = _fetch_codex_models()
     assert models == DEFAULT_MODELS
+
+
+def test_write_auth_creates_private_file(auth_file):
+    _write_auth(
+        auth_file,
+        {
+            "auth_mode": "chatgpt",
+            "tokens": {"access_token": "access"},
+        },
+    )
+    assert stat.S_IMODE(auth_file.stat().st_mode) == 0o600
+
+
+def test_auth_path_uses_override(auth_file):
+    assert _auth_path() == auth_file
 
 
 def test_account_id_from_token_claim_order():
@@ -134,8 +162,7 @@ def test_account_id_from_token_claim_order():
     assert _account_id_from_token(jwt({"organization_id": "org_2"})) == "org_2"
 
 
-def test_missing_account_id_is_derived_and_persisted(tmp_path):
-    auth_file = tmp_path / "auth.json"
+def test_missing_account_id_is_derived_and_persisted(auth_file):
     data = {
         "auth_mode": "chatgpt",
         "tokens": {
@@ -149,8 +176,7 @@ def test_missing_account_id_is_derived_and_persisted(tmp_path):
     assert json.loads(auth_file.read_text())["tokens"]["account_id"] == "acct_from_id"
 
 
-def test_existing_account_id_is_preserved(tmp_path):
-    auth_file = tmp_path / "auth.json"
+def test_existing_account_id_is_preserved(auth_file):
     data = {
         "auth_mode": "chatgpt",
         "tokens": {
@@ -161,3 +187,44 @@ def test_existing_account_id_is_preserved(tmp_path):
     }
     assert _ensure_account_id(data, persist_path=auth_file) == "acct_existing"
     assert data["tokens"]["account_id"] == "acct_existing"
+
+
+def test_import_copies_codex_auth(auth_file, tmp_path):
+    source = tmp_path / "auth.json"
+    source.write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "id_token": jwt({"chatgpt_account_id": "acct_imported"}),
+                },
+            }
+        )
+    )
+    path, data = _import_codex_auth(source)
+    assert path == auth_file
+    assert data["login_type"] == "import"
+    assert data["tokens"]["account_id"] == "acct_imported"
+    assert json.loads(auth_file.read_text())["tokens"]["refresh_token"] == "refresh"
+
+
+def test_refresh_persists_updates(auth_file):
+    data = {
+        "auth_mode": "chatgpt",
+        "tokens": {"access_token": "old", "refresh_token": "refresh"},
+    }
+    with patch(
+        "llm_openai_codex._refresh",
+        return_value={
+            "access_token": jwt({"exp": int(time.time()) + 3600}),
+            "id_token": jwt({"chatgpt_account_id": "acct_refreshed"}),
+            "refresh_token": "new_refresh",
+        },
+    ):
+        _refresh_auth(data, auth_file)
+    saved = json.loads(auth_file.read_text())
+    assert saved["tokens"]["refresh_token"] == "new_refresh"
+    assert saved["tokens"]["account_id"] == "acct_refreshed"
+    assert saved["last_refresh"]
