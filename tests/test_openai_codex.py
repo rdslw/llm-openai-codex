@@ -95,6 +95,14 @@ def test_build_kwargs_verbosity_and_schema():
     assert kwargs["text"]["format"]["schema"] == prompt.schema
 
 
+def test_build_kwargs_forwards_extra_options():
+    model = CodexResponsesModel("gpt-5.4")
+    prompt = llm.Prompt(model=model, prompt="Hello")
+    prompt.options = model.Options(service_tier="flex")
+    kwargs = model._build_kwargs(prompt, None)
+    assert kwargs["service_tier"] == "flex"
+
+
 def test_fetch_codex_models_fallback():
     with patch(
         "llm_openai_codex.borrow_codex_key",

@@ -11,7 +11,7 @@ import llm
 from llm import AsyncModel, Model, Options, hookimpl
 from llm.utils import simplify_usage_dict
 import openai
-from pydantic import Field, create_model
+from pydantic import ConfigDict, Field, create_model
 
 
 # --- Vendored borrow_codex_key ---
@@ -210,6 +210,8 @@ class VerbosityEnum(str, Enum):
 
 
 class CodexOptions(Options):
+    model_config = ConfigDict(extra="allow")
+
     max_output_tokens: Optional[int] = Field(
         description="Upper bound for tokens in the response.",
         ge=0,
@@ -396,6 +398,11 @@ class _SharedCodexResponses:
                 }
         if text:
             kwargs["text"] = text
+
+        extras = getattr(prompt.options, "__pydantic_extra__", None) or {}
+        for key, value in extras.items():
+            if value is not None and key not in kwargs:
+                kwargs[key] = value
         return kwargs
 
     def _handle_event(self, event, response):
