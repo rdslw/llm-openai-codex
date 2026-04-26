@@ -12,14 +12,14 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from enum import Enum
-from typing import AsyncGenerator, Iterator, Optional
+from typing import Optional
 
 import click
 import llm
 from llm import AsyncModel, Model, Options, hookimpl
 from llm.utils import simplify_usage_dict
 import openai
-from pydantic import ConfigDict, Field, create_model
+from pydantic import ConfigDict, Field
 
 
 # --- Plugin-owned Codex auth ---

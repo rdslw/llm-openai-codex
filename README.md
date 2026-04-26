@@ -1,43 +1,70 @@
-# llm-openai-via-codex
+# llm-openai-codex
 
-[![PyPI](https://img.shields.io/pypi/v/llm-openai-via-codex.svg)](https://pypi.org/project/llm-openai-via-codex/)
-[![Changelog](https://img.shields.io/github/v/release/simonw/llm-openai-via-codex?include_prereleases&label=changelog)](https://github.com/simonw/llm-openai-via-codex/releases)
-[![Tests](https://github.com/simonw/llm-openai-via-codex/actions/workflows/test.yml/badge.svg)](https://github.com/simonw/llm-openai-via-codex/actions/workflows/test.yml)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/simonw/llm-openai-via-codex/blob/main/LICENSE)
+LLM plugin for accessing ChatGPT/Codex-backed OpenAI models through the Responses API.
 
-Access OpenAI models via an existing Codex subscription
+This project is forked from and based on Simon Willison's `llm-openai-via-codex`.
 
-Apparently [this is OK](https://twitter.com/romainhuet/status/2038699202834841962)! There's more background [on my blog](https://simonwillison.net/2026/Apr/23/gpt-5-5/).
+## Changes from the original plugin
+
+- Package renamed to `llm-openai-codex`.
+- Model prefix changed to `codex/`.
+- Plugin-owned auth is stored in LLM's user config directory as `auth-codex.json`.
+- `llm codex` auth commands manage login, import, status, refresh, and logout.
+- Explicit `verbosity` option maps to Responses API `text.verbosity`.
+- Extra Responses API options are forwarded when LLM accepts them.
+- Missing `account_id` values are derived from OAuth JWT claims when possible.
 
 ## Installation
 
 Install this plugin in the same environment as [LLM](https://llm.datasette.io/).
+
 ```bash
-llm install llm-openai-via-codex
+llm install llm-openai-codex
 ```
+
 ## Usage
 
-First, make sure you have installed and authenticated [OpenAI Codex CLI](https://github.com/openai/codex).
-
-To see the models available via your Codex subscription run:
+Authenticate the plugin:
 
 ```bash
-llm models -q openai-codex
+llm codex login
 ```
-To run a prompt against one of those models:
+
+List available Codex-backed models:
+
 ```bash
-llm -m openai-codex/gpt-5.5 'Generate an SVG of a pelican riding a bicycle'
+llm models -q codex
 ```
+
+Run a prompt:
+
+```bash
+llm -m codex/gpt-5.5 "Hello"
+```
+
+Use Responses API verbosity:
+
+```bash
+llm -m codex/gpt-5.5 -o verbosity low "Summarize this"
+```
+
+## Auth commands
+
+```bash
+llm codex login
+llm codex login --device-code
+llm codex status
+llm codex refresh
+llm codex import
+llm codex logout
+```
+
+`llm codex import` copies ChatGPT OAuth tokens from `${CODEX_HOME:-~/.codex}/auth.json` into the plugin-owned `auth-codex.json`. Normal model calls read only the plugin-owned auth file.
 
 ## Development
 
-To set up this plugin locally, first checkout the code. Run the tests using `uv`:
 ```bash
-cd llm-openai-via-codex
 uv run pytest
-```
-To run LLM with the dev plugin installed:
-```bash
-uv run llm -m models
-uv run llm -m openai-codex/gpt-5.5 'Talk to me in Swedish'
+uv run llm plugins
+uv run llm codex status
 ```

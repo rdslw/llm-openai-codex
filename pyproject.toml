@@ -1,11 +1,12 @@
 [project]
 name = "llm-openai-codex"
-version = "0.1a0"
+version = "0.2.0"
 description = "Access OpenAI models via a Codex subscription"
 readme = "README.md"
 authors = [
     {name = "llm-openai-codex contributors"},
     {name = "Simon Willison"},
+    {name = "Radoslaw Stachowiak"},
 ]
 license = "Apache-2.0"
 classifiers = []
