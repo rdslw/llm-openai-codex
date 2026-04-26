@@ -28,6 +28,7 @@ REFRESH_URL = "https://auth.openai.com/oauth/token"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 REFRESH_SKEW_SECONDS = 30
 CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
+CHATGPT_BACKEND_BASE_URL = "https://chatgpt.com/backend-api"
 AUTH_MISSING_MESSAGE = (
     "No llm-openai-codex auth found. Run `llm codex login` or `llm codex import`."
 )
@@ -472,6 +473,179 @@ def _fetch_codex_models():
         return DEFAULT_MODELS
 
 
+def _request_json(url, headers):
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode(errors="replace")
+        raise BorrowKeyError(f"Request failed (HTTP {e.code}): {error_body}") from None
+    except urllib.error.URLError as e:
+        raise BorrowKeyError(f"Request failed: {e}") from None
+
+
+def _usage_headers():
+    token, account_id = get_codex_key()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "",
+    }
+    if account_id:
+        headers["ChatGPT-Account-ID"] = account_id
+    return headers
+
+
+def _fetch_usage():
+    return _request_json(f"{CHATGPT_BACKEND_BASE_URL}/wham/usage", _usage_headers())
+
+
+def _window_from_payload(window):
+    if not window:
+        return None
+    used_percent = window.get("used_percent")
+    try:
+        used_percent = float(used_percent)
+    except (TypeError, ValueError):
+        return None
+    return {
+        "used_percent": used_percent,
+        "window_minutes": _window_minutes(window.get("limit_window_seconds")),
+        "resets_at": window.get("reset_at"),
+    }
+
+
+def _window_minutes(seconds):
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0:
+        return None
+    return int(round(seconds / 60))
+
+
+def _duration_label(minutes, fallback):
+    if not minutes:
+        return fallback
+    if minutes % (60 * 24 * 7) == 0:
+        weeks = minutes // (60 * 24 * 7)
+        return "weekly" if weeks == 1 else f"{weeks}w"
+    if minutes % (60 * 24) == 0:
+        days = minutes // (60 * 24)
+        return f"{days}d"
+    if minutes % 60 == 0:
+        hours = minutes // 60
+        return f"{hours}h"
+    return f"{minutes}m"
+
+
+def _capitalize_first(value):
+    return value[:1].upper() + value[1:] if value else value
+
+
+def _reset_label(resets_at, now=None):
+    if resets_at is None:
+        return None
+    try:
+        reset = datetime.fromtimestamp(int(resets_at), timezone.utc).astimezone()
+    except (OSError, TypeError, ValueError):
+        return None
+    now = now or datetime.now().astimezone()
+    if reset.date() == now.date():
+        return reset.strftime("%H:%M")
+    day = reset.strftime("%d").lstrip("0") or "0"
+    return f"{reset.strftime('%H:%M')} on {day} {reset.strftime('%b')}"
+
+
+def _limit_bar(percent_remaining, width=20):
+    ratio = max(0.0, min(1.0, percent_remaining / 100.0))
+    filled = min(width, round(ratio * width))
+    return "[" + ("█" * filled) + ("░" * (width - filled)) + "]"
+
+
+def _format_usage_window(label, window, now=None):
+    remaining = max(0.0, min(100.0, 100.0 - window["used_percent"]))
+    text = f"{label}: {_limit_bar(remaining)} {remaining:.0f}% left"
+    reset = _reset_label(window.get("resets_at"), now=now)
+    if reset:
+        text += f" (resets {reset})"
+    return text
+
+
+def _format_credits(credits):
+    if not credits or not credits.get("has_credits"):
+        return None
+    if credits.get("unlimited"):
+        return "Credits: Unlimited"
+    balance = credits.get("balance")
+    if balance in (None, ""):
+        return None
+    try:
+        balance = str(round(float(balance)))
+    except (TypeError, ValueError):
+        balance = str(balance)
+    return f"Credits: {balance} credits"
+
+
+def _rate_limit_reached_text(value):
+    if not value:
+        return None
+    if isinstance(value, dict):
+        value = value.get("type") or value.get("kind")
+    if not isinstance(value, str) or not value:
+        return None
+    return value.replace("_", " ").capitalize()
+
+
+def _rate_limit_warning(payload, rate_limit):
+    reached_text = _rate_limit_reached_text(payload.get("rate_limit_reached_type"))
+    if reached_text:
+        return reached_text
+    if rate_limit and rate_limit.get("limit_reached") is True:
+        return "Rate limit reached"
+    return None
+
+
+def _format_usage(payload, now=None):
+    lines = [
+        "Codex usage details: https://chatgpt.com/codex/settings/usage",
+    ]
+    plan_type = payload.get("plan_type")
+    account = payload.get("account")
+    account_email = (
+        payload.get("account_email")
+        or payload.get("email")
+        or (account.get("email") if isinstance(account, dict) else None)
+    )
+    if account_email and plan_type:
+        lines.append(f"Account: {account_email} ({_capitalize_first(plan_type)})")
+    rate_limit = payload.get("rate_limit") or {}
+    warning = _rate_limit_warning(payload, rate_limit)
+    if warning:
+        lines.append(f"Rate limit: {warning}")
+    primary = _window_from_payload(rate_limit.get("primary_window"))
+    if primary:
+        label = (
+            f"{_capitalize_first(_duration_label(primary.get('window_minutes'), '5h'))} "
+            "limit"
+        )
+        lines.append(_format_usage_window(label, primary, now=now))
+    secondary = _window_from_payload(rate_limit.get("secondary_window"))
+    if secondary:
+        label = (
+            f"{_capitalize_first(_duration_label(secondary.get('window_minutes'), 'weekly'))} "
+            "limit"
+        )
+        lines.append(_format_usage_window(label, secondary, now=now))
+    credits_line = _format_credits(payload.get("credits"))
+    if credits_line:
+        lines.append(credits_line)
+    if len(lines) <= (2 if account_email and plan_type else 1):
+        lines.append("No usage limit data returned.")
+    return "\n".join(lines)
+
+
 # --- LLM Plugin ---
 
 
@@ -814,6 +988,16 @@ def status():
     click.echo(f"access_token exp: {_exp_status(tokens.get('access_token'))}")
     if tokens.get("id_token"):
         click.echo(f"id_token exp: {_exp_status(tokens.get('id_token'))}")
+
+
+@codex.command()
+def usage():
+    "Show Codex usage limits and credits."
+    try:
+        payload = _fetch_usage()
+    except BorrowKeyError as e:
+        raise click.ClickException(str(e)) from None
+    click.echo(_format_usage(payload))
 
 
 @codex.command()

@@ -2,6 +2,7 @@ import base64
 import json
 import stat
 import time
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 from click.testing import CliRunner
@@ -16,6 +17,7 @@ from llm_openai_codex import (
     DEVICE_REDIRECT_URI,
     DEVICE_TOKEN_URL,
     DEVICE_USER_CODE_URL,
+    CHATGPT_BACKEND_BASE_URL,
     _account_id_from_token,
     _auth_path,
     _device_code_login,
@@ -23,6 +25,8 @@ from llm_openai_codex import (
     _exchange_authorization_code,
     _fetch_codex_models,
     _import_codex_auth,
+    _fetch_usage,
+    _format_usage,
     _post_json_status,
     _read_auth,
     _refresh,
@@ -179,6 +183,132 @@ def test_fetch_codex_models_suppresses_default_user_agent():
     assert captured["headers"]["Authorization"] == "Bearer token"
     assert captured["headers"]["Chatgpt-account-id"] == "acct"
     assert captured["headers"]["User-agent"] == ""
+
+
+def test_fetch_usage_uses_wham_usage_endpoint_and_auth_headers():
+    captured = {}
+
+    def fake_request(url, headers):
+        captured["url"] = url
+        captured["headers"] = headers
+        return {"plan_type": "plus"}
+
+    with patch("llm_openai_codex.get_codex_key", return_value=("token", "acct")):
+        with patch("llm_openai_codex._request_json", fake_request):
+            payload = _fetch_usage()
+
+    assert payload == {"plan_type": "plus"}
+    assert captured["url"] == f"{CHATGPT_BACKEND_BASE_URL}/wham/usage"
+    assert captured["headers"] == {
+        "Authorization": "Bearer token",
+        "User-Agent": "",
+        "ChatGPT-Account-ID": "acct",
+    }
+
+
+def test_format_usage_shows_limits_and_credits():
+    payload = {
+        "plan_type": "plus",
+        "account_email": "user@example.com",
+        "rate_limit": {
+            "primary_window": {
+                "used_percent": 74,
+                "limit_window_seconds": 18000,
+                "reset_at": 1777210200,
+            },
+            "secondary_window": {
+                "used_percent": 24,
+                "limit_window_seconds": 604800,
+                "reset_at": 1777464540,
+            },
+        },
+        "credits": {
+            "has_credits": True,
+            "unlimited": False,
+            "balance": "12.4",
+        },
+    }
+    now = datetime(2026, 4, 26, 12, 0, tzinfo=timezone.utc).astimezone()
+    output = _format_usage(payload, now=now)
+
+    assert not output.startswith("Codex usage\n")
+    assert output.startswith(
+        "Codex usage details: https://chatgpt.com/codex/settings/usage"
+    )
+    assert "Account: user@example.com (Plus)" in output
+    assert "5h limit: [█████░░░░░░░░░░░░░░░] 26% left (resets 15:30)" in output
+    assert (
+        "Weekly limit: [███████████████░░░░░] 76% left "
+        "(resets 14:09 on 29 Apr)"
+    ) in output
+    assert "Credits: 12 credits" in output
+
+
+def test_format_usage_shows_unlimited_credits():
+    payload = {
+        "rate_limit": None,
+        "credits": {"has_credits": True, "unlimited": True, "balance": None},
+    }
+
+    output = _format_usage(payload)
+
+    assert "Credits: Unlimited" in output
+
+
+def test_format_usage_omits_plan_without_account_email():
+    output = _format_usage({"plan_type": "plus"})
+
+    assert "Plan:" not in output
+    assert "Account:" not in output
+    assert "No usage limit data returned." in output
+
+
+def test_format_usage_shows_rate_limit_reached_type():
+    output = _format_usage(
+        {
+            "rate_limit_reached_type": "workspace_member_usage_limit_reached",
+            "rate_limit": {
+                "allowed": False,
+                "limit_reached": True,
+                "primary_window": {
+                    "used_percent": 100,
+                    "limit_window_seconds": 18000,
+                    "reset_at": None,
+                },
+            },
+        }
+    )
+
+    assert "Rate limit: Workspace member usage limit reached" in output
+    assert "5h limit: [░░░░░░░░░░░░░░░░░░░░] 0% left" in output
+
+
+def test_format_usage_shows_limit_reached_without_reached_type():
+    output = _format_usage(
+        {
+            "rate_limit": {
+                "allowed": False,
+                "limit_reached": True,
+            },
+        }
+    )
+
+    assert "Rate limit: Rate limit reached" in output
+
+
+def test_usage_command_prints_formatted_usage():
+    with patch(
+        "llm_openai_codex._fetch_usage",
+        return_value={"plan_type": "plus", "account_email": "user@example.com"},
+    ):
+        result = CliRunner().invoke(codex, ["usage"])
+
+    assert result.exit_code == 0
+    assert (
+        "Codex usage details: https://chatgpt.com/codex/settings/usage"
+        in result.output
+    )
+    assert "Account: user@example.com (Plus)" in result.output
 
 
 def test_write_auth_creates_private_file(auth_file):
