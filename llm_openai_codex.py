@@ -41,6 +41,8 @@ def borrow_codex_key():
             "No ChatGPT tokens found in auth.json. Run `codex login` first."
         )
 
+    _ensure_account_id(data, persist_path=auth_path)
+
     access_token = tokens["access_token"]
     account_id = tokens.get("account_id")
     exp = _jwt_exp(access_token)
@@ -65,10 +67,11 @@ def borrow_codex_key():
 
     data["tokens"] = tokens
     data["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+    _ensure_account_id(data)
 
     _write_auth(auth_path, data)
 
-    return tokens["access_token"], account_id
+    return tokens["access_token"], tokens.get("account_id")
 
 
 def _auth_path():
@@ -100,14 +103,60 @@ def _write_auth(path, data):
     os.chmod(path, 0o600)
 
 
-def _jwt_exp(token):
+def _jwt_payload(token):
     try:
         payload_b64 = token.split(".")[1]
-        payload_b64 += "=" * (4 - len(payload_b64) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
-        return payload.get("exp")
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload_b64))
     except Exception:
         return None
+
+
+def _jwt_exp(token):
+    payload = _jwt_payload(token)
+    if payload:
+        return payload.get("exp")
+    return None
+
+
+def _account_id_from_token(token):
+    payload = _jwt_payload(token)
+    if not payload:
+        return None
+    account_id = payload.get("chatgpt_account_id")
+    if account_id:
+        return account_id
+    auth_claims = payload.get("https://api.openai.com/auth")
+    if isinstance(auth_claims, dict) and auth_claims.get("chatgpt_account_id"):
+        return auth_claims["chatgpt_account_id"]
+    organizations = payload.get("organizations")
+    if isinstance(organizations, list) and organizations:
+        organization_id = organizations[0].get("id")
+        if isinstance(organization_id, str) and organization_id:
+            return organization_id
+    organization_id = payload.get("organization_id")
+    if isinstance(organization_id, str) and organization_id:
+        return organization_id
+    return None
+
+
+def _ensure_account_id(data, persist_path=None):
+    tokens = data.get("tokens") or {}
+    if tokens.get("account_id"):
+        return tokens["account_id"]
+    account_id = None
+    for token_key in ("id_token", "access_token"):
+        token = tokens.get(token_key)
+        if token:
+            account_id = _account_id_from_token(token)
+            if account_id:
+                break
+    if account_id:
+        tokens["account_id"] = account_id
+        data["tokens"] = tokens
+        if persist_path is not None:
+            _write_auth(persist_path, data)
+    return account_id
 
 
 def _refresh(refresh_token):
