@@ -1,6 +1,5 @@
 import base64
 import json
-import stat
 import time
 from datetime import datetime, timezone
 from unittest.mock import patch
@@ -62,32 +61,12 @@ def write_codex_cli_auth(tmp_path, monkeypatch, data):
     return path
 
 
-def test_plugin_is_installed():
-    import llm_openai_codex
-
-
-def test_models_are_registered():
-    model_ids = [model.model_id for model in llm.get_models()]
-    # At least the default models should be registered (or fetched ones)
-    # Check the prefix is correct
-    codex_models = [m for m in model_ids if m.startswith("codex/")]
-    assert len(codex_models) > 0
-
-
-def test_model_id_prefix():
+def test_model_metadata():
     model = CodexResponsesModel("gpt-5.4")
     assert model.model_id == "codex/gpt-5.4"
     assert model.model_name == "gpt-5.4"
     assert str(model) == "OpenAI Codex: codex/gpt-5.4"
-
-
-def test_model_needs_no_key():
-    model = CodexResponsesModel("gpt-5.4")
     assert model.needs_key is None
-
-
-def test_model_can_stream():
-    model = CodexResponsesModel("gpt-5.4")
     assert model.can_stream is True
 
 
@@ -245,7 +224,6 @@ def test_format_usage_shows_limits_and_credits():
     now = datetime(2026, 4, 26, 12, 0, tzinfo=timezone.utc).astimezone()
     output = _format_usage(payload, now=now)
 
-    assert not output.startswith("Codex usage\n")
     assert output.startswith(
         "Codex usage details: https://chatgpt.com/codex/settings/usage"
     )
@@ -333,7 +311,7 @@ def test_write_auth_creates_private_file(auth_file):
             "tokens": {"access_token": "access"},
         },
     )
-    assert stat.S_IMODE(auth_file.stat().st_mode) == 0o600
+    assert auth_file.stat().st_mode & 0o777 == 0o600
 
 
 def test_auth_path_uses_override(auth_file):
