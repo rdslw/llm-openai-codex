@@ -13,8 +13,12 @@ from llm_openai_codex import (
     BorrowKeyError,
     CodexResponsesModel,
     DEFAULT_MODELS,
+    DEVICE_REDIRECT_URI,
+    DEVICE_TOKEN_URL,
+    DEVICE_USER_CODE_URL,
     _account_id_from_token,
     _auth_path,
+    _device_code_login,
     _ensure_account_id,
     _fetch_codex_models,
     _import_codex_auth,
@@ -278,3 +282,51 @@ def test_refresh_command_persists_updates(auth_file):
         result = CliRunner().invoke(codex, ["refresh"])
     assert result.exit_code == 0, result.output
     assert json.loads(auth_file.read_text())["tokens"]["access_token"] == "new"
+
+
+def test_device_code_login_matches_codex_flow():
+    responses = [
+        (
+            200,
+            {
+                "device_auth_id": "device-auth-123",
+                "user_code": "CODE-12345",
+                "interval": "0",
+            },
+        ),
+        (
+            200,
+            {
+                "authorization_code": "poll-code-321",
+                "code_challenge": "code-challenge-321",
+                "code_verifier": "code-verifier-321",
+            },
+        ),
+    ]
+    with patch("llm_openai_codex._post_json_status", side_effect=responses) as post_json:
+        with patch(
+            "llm_openai_codex._exchange_authorization_code",
+            return_value={"access_token": "access"},
+        ) as exchange:
+            tokens = _device_code_login()
+
+    assert tokens == {"access_token": "access"}
+    assert post_json.call_args_list[0].args == (
+        DEVICE_USER_CODE_URL,
+        {"client_id": "app_EMoamEEZ73f0CkXaXp7hrann"},
+    )
+    assert post_json.call_args_list[1].args == (
+        DEVICE_TOKEN_URL,
+        {"device_auth_id": "device-auth-123", "user_code": "CODE-12345"},
+    )
+    exchange.assert_called_once_with(
+        "poll-code-321",
+        "code-verifier-321",
+        redirect_uri=DEVICE_REDIRECT_URI,
+    )
+
+
+def test_device_code_login_reports_disabled_server():
+    with patch("llm_openai_codex._post_json_status", return_value=(404, {})):
+        with pytest.raises(BorrowKeyError, match="not enabled"):
+            _device_code_login()

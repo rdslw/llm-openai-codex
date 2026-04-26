@@ -32,6 +32,7 @@ AUTH_MISSING_MESSAGE = (
     "No llm-openai-codex auth found. Run `llm codex login` or `llm codex import`."
 )
 REDIRECT_URI = "http://localhost:1455/auth/callback"
+DEVICE_REDIRECT_URI = "https://auth.openai.com/deviceauth/callback"
 DEVICE_VERIFICATION_URL = "https://auth.openai.com/codex/device"
 DEVICE_USER_CODE_URL = "https://auth.openai.com/api/accounts/deviceauth/usercode"
 DEVICE_TOKEN_URL = "https://auth.openai.com/api/accounts/deviceauth/token"
@@ -267,6 +268,13 @@ def _import_codex_auth(path=None):
 
 
 def _post_json(url, payload):
+    status, data = _post_json_status(url, payload)
+    if 200 <= status < 300:
+        return data
+    raise BorrowKeyError(f"Request to {url} failed (HTTP {status}): {data}")
+
+
+def _post_json_status(url, payload):
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
@@ -274,16 +282,17 @@ def _post_json(url, payload):
     )
     try:
         with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read())
+            status = getattr(resp, "status", None) or resp.getcode()
+            body = resp.read()
+            data = json.loads(body) if body else {}
+            return status, data
     except urllib.error.HTTPError as e:
         error_body = e.read().decode(errors="replace")
         try:
             error_data = json.loads(error_body)
         except Exception:
             error_data = {"error": error_body}
-        raise BorrowKeyError(
-            f"Request to {url} failed (HTTP {e.code}): {error_data}"
-        ) from None
+        return e.code, error_data
     except urllib.error.URLError as e:
         raise BorrowKeyError(f"Request to {url} failed: {e}") from None
 
@@ -387,7 +396,14 @@ def _browser_login():
 
 
 def _device_code_login():
-    start = _post_json(DEVICE_USER_CODE_URL, {"client_id": CLIENT_ID})
+    status, start = _post_json_status(DEVICE_USER_CODE_URL, {"client_id": CLIENT_ID})
+    if status == 404:
+        raise BorrowKeyError(
+            "Device-code login is not enabled for this Codex auth server. "
+            "Use `llm codex login` for browser login."
+        )
+    if not 200 <= status < 300:
+        raise BorrowKeyError(f"Device-code request failed with status {status}: {start}")
     device_auth_id = start.get("device_auth_id")
     user_code = start.get("user_code")
     interval = int(start.get("interval") or 5)
@@ -397,12 +413,22 @@ def _device_code_login():
         )
     click.echo(f"Open {DEVICE_VERIFICATION_URL}")
     click.echo(f"Enter code: {user_code}")
+    started = time.monotonic()
+    max_wait = 15 * 60
     while True:
-        time.sleep(interval)
-        poll = _post_json(DEVICE_TOKEN_URL, {"device_auth_id": device_auth_id})
-        error = poll.get("error") or poll.get("status")
-        if error in ("authorization_pending", "pending"):
+        elapsed = time.monotonic() - started
+        if elapsed >= max_wait:
+            raise BorrowKeyError("Device-code login timed out after 15 minutes.")
+        time.sleep(min(interval, max_wait - elapsed))
+        status, poll = _post_json_status(
+            DEVICE_TOKEN_URL,
+            {"device_auth_id": device_auth_id, "user_code": user_code},
+        )
+        if status in (403, 404):
             continue
+        if not 200 <= status < 300:
+            raise BorrowKeyError(f"Device-code login failed with status {status}: {poll}")
+        error = poll.get("error") or poll.get("status")
         if error == "slow_down":
             interval += 5
             continue
@@ -412,7 +438,7 @@ def _device_code_login():
             return _exchange_authorization_code(
                 authorization_code,
                 code_verifier,
-                redirect_uri=None,
+                redirect_uri=DEVICE_REDIRECT_URI,
             )
         if error:
             raise BorrowKeyError(f"Device-code login failed: {error}")
