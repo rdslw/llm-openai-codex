@@ -194,46 +194,29 @@ def _normalize_auth_data(tokens, login_type):
 
 
 def _refresh(refresh_token):
-    body = json.dumps(
-        {
-            "client_id": CLIENT_ID,
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-        }
-    ).encode()
+    payload = {
+        "client_id": CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }
+    status, data = _post_json_status(REFRESH_URL, payload)
+    if 200 <= status < 300:
+        return data
 
-    req = urllib.request.Request(
-        REFRESH_URL,
-        data=body,
-        headers={"Content-Type": "application/json"},
-    )
-
-    try:
-        with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode(errors="replace")
-        try:
-            error_data = json.loads(error_body)
-            error_code = error_data.get("error")
-        except Exception:
-            error_code = None
-
-        if error_code in (
-            "refresh_token_expired",
-            "refresh_token_reused",
-            "refresh_token_invalidated",
-        ):
-            raise BorrowKeyError(
-                f"Refresh token is no longer valid ({error_code}). "
-                "Run `llm codex login` to re-authenticate."
-            ) from None
-
+    error_code = _error_code(data)
+    if error_code in (
+        "refresh_token_expired",
+        "refresh_token_reused",
+        "refresh_token_invalidated",
+    ):
         raise BorrowKeyError(
-            f"Token refresh failed (HTTP {e.code}): {error_body}"
+            f"Refresh token is no longer valid ({error_code}). "
+            "Run `llm codex login` to re-authenticate."
         ) from None
-    except urllib.error.URLError as e:
-        raise BorrowKeyError(f"Token refresh failed (network error): {e}") from None
+
+    raise BorrowKeyError(
+        f"Token refresh failed (HTTP {status}): {json.dumps(data)}"
+    ) from None
 
 
 def _refresh_auth(data, auth_path=None):
@@ -278,10 +261,14 @@ def _post_json_status(url, payload):
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "",
+        },
     )
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=20) as resp:
             status = getattr(resp, "status", None) or resp.getcode()
             body = resp.read()
             data = json.loads(body) if body else {}
@@ -295,6 +282,15 @@ def _post_json_status(url, payload):
         return e.code, error_data
     except urllib.error.URLError as e:
         raise BorrowKeyError(f"Request to {url} failed: {e}") from None
+
+
+def _error_code(data):
+    error = data.get("error") if isinstance(data, dict) else None
+    if isinstance(error, str):
+        return error
+    if isinstance(error, dict):
+        return error.get("code") or error.get("type")
+    return data.get("code") if isinstance(data, dict) else None
 
 
 def _pkce_pair():
@@ -313,22 +309,12 @@ def _exchange_authorization_code(code, code_verifier, redirect_uri=REDIRECT_URI)
     }
     if redirect_uri:
         payload["redirect_uri"] = redirect_uri
-    body = json.dumps(payload).encode()
-    req = urllib.request.Request(
-        REFRESH_URL,
-        data=body,
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode(errors="replace")
-        raise BorrowKeyError(
-            f"Authorization code exchange failed (HTTP {e.code}): {error_body}"
-        ) from None
-    except urllib.error.URLError as e:
-        raise BorrowKeyError(f"Authorization code exchange failed: {e}") from None
+    status, data = _post_json_status(REFRESH_URL, payload)
+    if 200 <= status < 300:
+        return data
+    raise BorrowKeyError(
+        f"Authorization code exchange failed (HTTP {status}): {json.dumps(data)}"
+    ) from None
 
 
 def _browser_login():
@@ -467,6 +453,7 @@ def _fetch_codex_models():
     headers = {"Authorization": f"Bearer {token}"}
     if account_id:
         headers["ChatGPT-Account-ID"] = account_id
+    headers["User-Agent"] = ""
 
     req = urllib.request.Request(
         f"{CODEX_BASE_URL}/models?client_version=1.0.0",

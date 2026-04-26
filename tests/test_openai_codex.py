@@ -20,9 +20,12 @@ from llm_openai_codex import (
     _auth_path,
     _device_code_login,
     _ensure_account_id,
+    _exchange_authorization_code,
     _fetch_codex_models,
     _import_codex_auth,
+    _post_json_status,
     _read_auth,
+    _refresh,
     _refresh_auth,
     _write_auth,
     codex,
@@ -139,6 +142,43 @@ def test_fetch_codex_models_fallback():
     ):
         models = _fetch_codex_models()
     assert models == DEFAULT_MODELS
+
+
+def test_fetch_codex_models_suppresses_default_user_agent():
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self):
+            return json.dumps(
+                {
+                    "models": [
+                        {
+                            "slug": "gpt-test",
+                            "supported_in_api": True,
+                            "visibility": "list",
+                        }
+                    ]
+                }
+            ).encode()
+
+    captured = {}
+
+    def fake_urlopen(req):
+        captured["headers"] = dict(req.header_items())
+        return FakeResponse()
+
+    with patch("llm_openai_codex.get_codex_key", return_value=("token", "acct")):
+        with patch("llm_openai_codex.urllib.request.urlopen", fake_urlopen):
+            models = _fetch_codex_models()
+
+    assert models == ["gpt-test"]
+    assert captured["headers"]["Authorization"] == "Bearer token"
+    assert captured["headers"]["Chatgpt-account-id"] == "acct"
+    assert captured["headers"]["User-agent"] == ""
 
 
 def test_write_auth_creates_private_file(auth_file):
@@ -330,3 +370,65 @@ def test_device_code_login_reports_disabled_server():
     with patch("llm_openai_codex._post_json_status", return_value=(404, {})):
         with pytest.raises(BorrowKeyError, match="not enabled"):
             _device_code_login()
+
+
+def test_post_json_status_uses_urllib_without_default_user_agent():
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self):
+            return b'{"ok": true}'
+
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["request"] = req
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    with patch("llm_openai_codex.urllib.request.urlopen", fake_urlopen):
+        status, data = _post_json_status("https://example.com/path", {"x": 1})
+
+    assert status == 200
+    assert data == {"ok": True}
+    assert captured["timeout"] == 20
+    assert captured["request"].full_url == "https://example.com/path"
+    assert captured["request"].data == b'{"x": 1}'
+    assert dict(captured["request"].header_items()) == {
+        "Accept": "application/json",
+        "Content-type": "application/json",
+        "User-agent": "",
+    }
+
+
+def test_refresh_and_exchange_use_json_post_helper():
+    calls = []
+
+    def fake_post(url, payload):
+        calls.append((url, payload))
+        return 200, {"access_token": "access"}
+
+    with patch("llm_openai_codex._post_json_status", fake_post):
+        assert _refresh("refresh") == {"access_token": "access"}
+        assert _exchange_authorization_code("code", "verifier") == {
+            "access_token": "access"
+        }
+
+    assert calls[0][1] == {
+        "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+        "grant_type": "refresh_token",
+        "refresh_token": "refresh",
+    }
+    assert calls[1][1] == {
+        "grant_type": "authorization_code",
+        "code": "code",
+        "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+        "code_verifier": "verifier",
+        "redirect_uri": "http://localhost:1455/auth/callback",
+    }
