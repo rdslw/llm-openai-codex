@@ -21,6 +21,7 @@ from llm_openai_codex import (
     CHATGPT_BACKEND_BASE_URL,
     _account_id_from_token,
     _auth_path,
+    _codex_cli_auth_path,
     _device_code_login,
     _ensure_account_id,
     _exchange_authorization_code,
@@ -32,7 +33,9 @@ from llm_openai_codex import (
     _read_auth,
     _refresh,
     _refresh_auth,
+    _resolve_auth,
     _write_auth,
+    get_codex_key,
     codex,
 )
 
@@ -46,6 +49,16 @@ def jwt(payload):
 def auth_file(tmp_path, monkeypatch):
     path = tmp_path / "auth-codex.json"
     monkeypatch.setenv("LLM_OPENAI_CODEX_AUTH_FILE", str(path))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    return path
+
+
+def write_codex_cli_auth(tmp_path, monkeypatch, data):
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir(exist_ok=True)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    path = codex_home / "auth.json"
+    path.write_text(json.dumps(data))
     return path
 
 
@@ -327,6 +340,134 @@ def test_auth_path_uses_override(auth_file):
     assert _auth_path() == auth_file
 
 
+def test_codex_cli_auth_path_uses_codex_home(auth_file, tmp_path, monkeypatch):
+    codex_home = tmp_path / "custom-codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    assert _codex_cli_auth_path() == codex_home / "auth.json"
+
+
+def test_resolve_auth_uses_plugin_auth_first(auth_file, tmp_path, monkeypatch):
+    plugin_data = {
+        "auth_mode": "chatgpt",
+        "tokens": {"access_token": "plugin"},
+    }
+    _write_auth(auth_file, plugin_data)
+    write_codex_cli_auth(
+        tmp_path,
+        monkeypatch,
+        {"auth_mode": "chatgpt", "tokens": {"access_token": "cli"}},
+    )
+
+    auth = _resolve_auth()
+
+    assert auth.path == auth_file
+    assert auth.label == "plugin-owned auth"
+    assert auth.data["tokens"]["access_token"] == "plugin"
+    assert auth.read_only is False
+    assert auth.refreshable is True
+
+
+def test_resolve_auth_falls_back_to_codex_cli_auth(auth_file, tmp_path, monkeypatch):
+    cli_path = write_codex_cli_auth(
+        tmp_path,
+        monkeypatch,
+        {"auth_mode": "chatgpt", "tokens": {"access_token": "cli"}},
+    )
+
+    auth = _resolve_auth()
+
+    assert auth.path == cli_path
+    assert auth.label == "Codex CLI auth fallback (read-only)"
+    assert auth.data["tokens"]["access_token"] == "cli"
+    assert auth.read_only is True
+    assert auth.refreshable is False
+
+
+def test_existing_invalid_plugin_auth_does_not_fall_back_to_codex_cli(
+    auth_file, tmp_path, monkeypatch
+):
+    _write_auth(auth_file, {"auth_mode": "api", "tokens": {"access_token": "plugin"}})
+    write_codex_cli_auth(
+        tmp_path,
+        monkeypatch,
+        {"auth_mode": "chatgpt", "tokens": {"access_token": "cli"}},
+    )
+
+    with pytest.raises(BorrowKeyError, match="Expected auth_mode 'chatgpt'"):
+        _resolve_auth()
+
+
+def test_get_codex_key_uses_codex_cli_fallback_without_persisting(
+    auth_file, tmp_path, monkeypatch
+):
+    token = jwt(
+        {
+            "exp": int(time.time()) + 3600,
+            "chatgpt_account_id": "acct_from_access",
+        }
+    )
+    cli_path = write_codex_cli_auth(
+        tmp_path,
+        monkeypatch,
+        {"auth_mode": "chatgpt", "tokens": {"access_token": token}},
+    )
+
+    assert get_codex_key() == (token, "acct_from_access")
+    saved = json.loads(cli_path.read_text())
+    assert "account_id" not in saved["tokens"]
+
+
+def test_get_codex_key_refuses_to_refresh_codex_cli_fallback(
+    auth_file, tmp_path, monkeypatch
+):
+    token = jwt({"exp": int(time.time()) - 10})
+    write_codex_cli_auth(
+        tmp_path,
+        monkeypatch,
+        {
+            "auth_mode": "chatgpt",
+            "tokens": {"access_token": token, "refresh_token": "refresh"},
+        },
+    )
+
+    with patch("llm_openai_codex._refresh") as refresh:
+        with pytest.raises(BorrowKeyError) as excinfo:
+            get_codex_key()
+
+    refresh.assert_not_called()
+    assert "will not refresh shared Codex CLI auth" in str(excinfo.value)
+    assert "Run Codex CLI to refresh shared Codex CLI tokens" in str(excinfo.value)
+    assert AUTH_RECOVERY_MESSAGE in str(excinfo.value)
+
+
+def test_get_codex_key_reports_missing_plugin_access_token(auth_file):
+    _write_auth(auth_file, {"auth_mode": "chatgpt", "tokens": {"refresh_token": "r"}})
+
+    with pytest.raises(BorrowKeyError) as excinfo:
+        get_codex_key()
+
+    assert "Plugin-owned auth" in str(excinfo.value)
+    assert "does not contain an access token" in str(excinfo.value)
+    assert AUTH_RECOVERY_MESSAGE in str(excinfo.value)
+
+
+def test_get_codex_key_reports_missing_codex_cli_access_token(
+    auth_file, tmp_path, monkeypatch
+):
+    write_codex_cli_auth(
+        tmp_path,
+        monkeypatch,
+        {"auth_mode": "chatgpt", "tokens": {"refresh_token": "r"}},
+    )
+
+    with pytest.raises(BorrowKeyError) as excinfo:
+        get_codex_key()
+
+    assert "Codex CLI auth" in str(excinfo.value)
+    assert "does not contain an access token" in str(excinfo.value)
+    assert "Run Codex CLI to refresh shared Codex CLI tokens" in str(excinfo.value)
+
+
 def test_account_id_from_token_claim_order():
     assert _account_id_from_token(jwt({"chatgpt_account_id": "acct_top"})) == "acct_top"
     assert (
@@ -412,6 +553,43 @@ def test_status_missing_auth_exits_cleanly(auth_file):
     assert result.exit_code == 0
     assert AUTH_MISSING_MESSAGE in result.output
     assert AUTH_RECOVERY_MESSAGE in result.output
+    assert "Plugin auth path:" in result.output
+    assert "Codex CLI auth path:" in result.output
+
+
+def test_status_shows_plugin_auth_source(auth_file):
+    _write_auth(
+        auth_file,
+        {"auth_mode": "chatgpt", "login_type": "chatgpt", "tokens": {"access_token": "x"}},
+    )
+
+    result = CliRunner().invoke(codex, ["status"])
+
+    assert result.exit_code == 0
+    assert "Auth source: plugin-owned auth" in result.output
+    assert f"Auth file: {auth_file}" in result.output
+
+
+def test_status_shows_codex_cli_fallback_source(auth_file, tmp_path, monkeypatch):
+    cli_path = write_codex_cli_auth(
+        tmp_path,
+        monkeypatch,
+        {
+            "auth_mode": "chatgpt",
+            "login_type": "chatgpt",
+            "tokens": {
+                "access_token": "access",
+                "id_token": jwt({"chatgpt_account_id": "acct_cli"}),
+            },
+        },
+    )
+
+    result = CliRunner().invoke(codex, ["status"])
+
+    assert result.exit_code == 0
+    assert "Auth source: Codex CLI auth fallback (read-only)" in result.output
+    assert f"Auth file: {cli_path}" in result.output
+    assert "account_id: acct_cli" in result.output
 
 
 def test_missing_refresh_token_uses_common_auth_recovery_message(auth_file):
@@ -438,6 +616,21 @@ def test_logout_removes_file(auth_file):
     assert not auth_file.exists()
 
 
+def test_logout_is_disabled_for_codex_cli_fallback(auth_file, tmp_path, monkeypatch):
+    cli_path = write_codex_cli_auth(
+        tmp_path,
+        monkeypatch,
+        {"auth_mode": "chatgpt", "tokens": {"access_token": "cli"}},
+    )
+
+    result = CliRunner().invoke(codex, ["logout"])
+
+    assert result.exit_code != 0
+    assert "Cannot logout while using read-only Codex CLI auth fallback" in result.output
+    assert str(cli_path) in result.output
+    assert cli_path.exists()
+
+
 def test_import_command_copies_auth(auth_file, tmp_path):
     source = tmp_path / "auth.json"
     source.write_text(
@@ -456,6 +649,30 @@ def test_import_command_copies_auth(auth_file, tmp_path):
     assert json.loads(auth_file.read_text())["tokens"]["account_id"] == "acct_cli"
 
 
+def test_import_command_refuses_to_overwrite_existing_plugin_auth(auth_file, tmp_path):
+    _write_auth(auth_file, {"auth_mode": "chatgpt", "tokens": {"access_token": "plugin"}})
+    source = tmp_path / "auth.json"
+    source.write_text(
+        json.dumps({"auth_mode": "chatgpt", "tokens": {"access_token": "cli"}})
+    )
+
+    result = CliRunner().invoke(codex, ["import", "--path", str(source)])
+
+    assert result.exit_code != 0
+    assert "Plugin-owned auth already exists" in result.output
+    assert json.loads(auth_file.read_text())["tokens"]["access_token"] == "plugin"
+
+
+def test_import_command_reports_missing_codex_cli_auth(auth_file, tmp_path):
+    source = tmp_path / "missing-auth.json"
+
+    result = CliRunner().invoke(codex, ["import", "--path", str(source)])
+
+    assert result.exit_code != 0
+    assert f"No Codex CLI auth found at {source}" in result.output
+    assert AUTH_RECOVERY_MESSAGE in result.output
+
+
 def test_refresh_command_persists_updates(auth_file):
     _write_auth(
         auth_file,
@@ -471,6 +688,28 @@ def test_refresh_command_persists_updates(auth_file):
         result = CliRunner().invoke(codex, ["refresh"])
     assert result.exit_code == 0, result.output
     assert json.loads(auth_file.read_text())["tokens"]["access_token"] == "new"
+
+
+def test_refresh_command_is_disabled_for_codex_cli_fallback(
+    auth_file, tmp_path, monkeypatch
+):
+    cli_path = write_codex_cli_auth(
+        tmp_path,
+        monkeypatch,
+        {
+            "auth_mode": "chatgpt",
+            "tokens": {"access_token": "cli", "refresh_token": "refresh"},
+        },
+    )
+
+    with patch("llm_openai_codex._refresh") as refresh:
+        result = CliRunner().invoke(codex, ["refresh"])
+
+    assert result.exit_code != 0
+    assert "Cannot refresh while using read-only Codex CLI auth fallback" in result.output
+    assert str(cli_path) in result.output
+    assert "Run Codex CLI to refresh shared Codex CLI tokens" in result.output
+    refresh.assert_not_called()
 
 
 def test_device_code_login_matches_codex_flow(capsys):

@@ -8,7 +8,7 @@ This project is forked from and based on Simon Willison's `llm-openai-via-codex`
 
 - Package renamed to `llm-openai-codex`.
 - Model prefix changed to `codex/`.
-- Plugin-owned auth is stored in LLM's user config directory as `auth-codex.json`.
+- Plugin-owned auth is stored in LLM's user config directory as `auth-codex.json`, with read-only fallback to `${CODEX_HOME:-~/.codex}/auth.json`.
 - `llm codex` auth commands manage login, import, status, refresh, and logout.
 - Explicit `verbosity` option maps to Responses API `text.verbosity`.
 - Extra Responses API options are forwarded when LLM accepts them.
@@ -31,7 +31,7 @@ Authenticate the plugin:
 llm codex login [--device-code]
 ```
 
-You can also import existing Codex CLI ChatGPT OAuth tokens with `llm codex import`.
+If you already use Codex CLI, the plugin can fall back to `${CODEX_HOME:-~/.codex}/auth.json` when `auth-codex.json` does not exist. You can also copy those tokens into plugin-owned auth with `llm codex import`.
 
 List available Codex-backed models:
 
@@ -63,7 +63,14 @@ llm codex import
 llm codex logout
 ```
 
-`llm codex import` copies ChatGPT OAuth tokens from `${CODEX_HOME:-~/.codex}/auth.json` into the plugin-owned `auth-codex.json`. Normal model calls read only the plugin-owned auth file.
+Auth source order:
+
+1. Plugin-owned `auth-codex.json`
+2. Read-only Codex CLI auth at `${CODEX_HOME:-~/.codex}/auth.json`
+
+`llm codex import` copies ChatGPT OAuth tokens from Codex CLI auth into plugin-owned `auth-codex.json`. It refuses to overwrite an existing `auth-codex.json`; run `llm codex logout` first if you want to replace plugin-owned auth.
+
+When using Codex CLI auth fallback, this plugin does not refresh or delete the shared Codex CLI auth file. If those tokens expire, run Codex CLI to refresh them, or run `llm codex login [--device-code]` to create plugin-owned auth. `llm codex status` shows which auth source is active.
 
 When authentication is missing or expired, run `llm codex login [--device-code]` or `llm codex import`.
 
@@ -74,7 +81,3 @@ uv run pytest
 uv run llm plugins
 uv run llm codex status
 ```
-
-## TODO
-
-- Analyze dual-mode auth allowing to work with both auth-codex.json and shared ~/.codex/auth.json from Codex CLI

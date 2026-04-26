@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import secrets
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import urllib.error
 import urllib.parse
@@ -34,6 +35,10 @@ AUTH_RECOVERY_MESSAGE = f"Run {LOGIN_COMMAND_HELP} or `llm codex import`."
 AUTH_MISSING_MESSAGE = (
     f"No llm-openai-codex auth found. {AUTH_RECOVERY_MESSAGE}"
 )
+CODEX_CLI_REFRESH_MESSAGE = (
+    "Run Codex CLI to refresh shared Codex CLI tokens, or "
+    f"{AUTH_RECOVERY_MESSAGE}"
+)
 REDIRECT_URI = "http://localhost:1455/auth/callback"
 DEVICE_REDIRECT_URI = "https://auth.openai.com/deviceauth/callback"
 DEVICE_VERIFICATION_URL = "https://auth.openai.com/codex/device"
@@ -45,35 +50,57 @@ class BorrowKeyError(Exception):
     pass
 
 
-def get_codex_key():
-    """
-    Return (access_token, account_id) from plugin-owned ChatGPT OAuth
-    credentials, refreshing the access token when it is expired or near-expiry.
-    """
-    auth_path = _auth_path()
-    data = _read_auth(auth_path)
+@dataclass
+class AuthContext:
+    path: Path
+    data: dict
+    read_only: bool = False
 
-    tokens = data.get("tokens")
-    if not tokens or not tokens.get("access_token"):
-        raise BorrowKeyError(AUTH_MISSING_MESSAGE)
+    @property
+    def tokens(self):
+        return self.data.get("tokens") or {}
 
-    _ensure_account_id(data, persist_path=auth_path)
+    @property
+    def account_id_persist_path(self):
+        return None if self.read_only else self.path
 
-    access_token = tokens["access_token"]
-    account_id = tokens.get("account_id")
-    exp = _jwt_exp(access_token)
+    @property
+    def label(self):
+        if self.read_only:
+            return "Codex CLI auth fallback (read-only)"
+        return "plugin-owned auth"
 
-    if exp is not None and time.time() < (exp - REFRESH_SKEW_SECONDS):
-        return access_token, account_id
+    @property
+    def name(self):
+        if self.read_only:
+            return "Codex CLI auth"
+        return "Plugin-owned auth"
 
-    refresh_token = tokens.get("refresh_token")
-    if not refresh_token:
-        raise BorrowKeyError(
-            f"No refresh token available. {AUTH_RECOVERY_MESSAGE}"
+    @property
+    def refreshable(self):
+        return not self.read_only
+
+    def missing_access_token_message(self):
+        if self.refreshable:
+            return (
+                f"{self.name} at {self.path} does not contain an access token. "
+                f"{AUTH_RECOVERY_MESSAGE}"
+            )
+        return (
+            f"{self.name} at {self.path} does not contain an access token. "
+            f"{CODEX_CLI_REFRESH_MESSAGE}"
         )
 
-    _refresh_auth(data, auth_path)
 
+def get_codex_key():
+    """
+    Return (access_token, account_id) from ChatGPT OAuth credentials.
+
+    Plugin-owned auth is preferred. Codex CLI auth is a read-only fallback and
+    is never refreshed or modified by this plugin.
+    """
+    auth = _resolve_auth()
+    tokens = _valid_auth_tokens(auth)
     return tokens["access_token"], tokens.get("account_id")
 
 
@@ -95,10 +122,63 @@ def _codex_cli_auth_path():
     return Path.home() / ".codex" / "auth.json"
 
 
-def _read_auth(path):
+def _resolve_auth():
+    plugin_path = _auth_path()
+    if plugin_path.exists():
+        return AuthContext(
+            path=plugin_path,
+            data=_read_auth(plugin_path),
+        )
+
+    codex_cli_path = _codex_cli_auth_path()
+    if codex_cli_path.exists():
+        return AuthContext(
+            path=codex_cli_path,
+            data=_read_auth(codex_cli_path),
+            read_only=True,
+        )
+
+    raise BorrowKeyError(
+        f"{AUTH_MISSING_MESSAGE} No Codex CLI auth fallback found. "
+        f"Plugin auth path: {plugin_path}. Codex CLI auth path: {codex_cli_path}. "
+    )
+
+
+def _valid_auth_tokens(auth):
+    tokens = auth.tokens
+    if not tokens.get("access_token"):
+        raise BorrowKeyError(auth.missing_access_token_message())
+
+    _ensure_account_id(auth.data, persist_path=auth.account_id_persist_path)
+
+    exp = _jwt_exp(tokens["access_token"])
+    if exp is not None and time.time() < (exp - REFRESH_SKEW_SECONDS):
+        return tokens
+
+    if not auth.refreshable:
+        raise BorrowKeyError(
+            "Codex CLI auth token is expired or cannot be checked, and "
+            "llm-openai-codex will not refresh shared Codex CLI auth. "
+            f"{CODEX_CLI_REFRESH_MESSAGE}"
+        )
+    _refresh_plugin_auth(auth)
+    return auth.tokens
+
+
+def _refresh_plugin_auth(auth):
+    if not auth.refreshable:
+        raise BorrowKeyError(
+            "Cannot refresh while using read-only Codex CLI auth fallback. "
+            f"Codex CLI auth path: {auth.path}. "
+            f"{CODEX_CLI_REFRESH_MESSAGE}"
+        )
+    _refresh_auth(auth.data, auth.path)
+
+
+def _read_auth(path, missing_message=None):
     path = Path(path)
     if not path.exists():
-        raise BorrowKeyError(AUTH_MISSING_MESSAGE)
+        raise BorrowKeyError(missing_message or AUTH_MISSING_MESSAGE)
     with path.open() as f:
         data = json.load(f)
     if data.get("auth_mode") != "chatgpt":
@@ -242,13 +322,24 @@ def _refresh_auth(data, auth_path=None):
 
 
 def _import_codex_auth(path=None):
+    auth_path = _auth_path()
+    if auth_path.exists():
+        raise BorrowKeyError(
+            f"Plugin-owned auth already exists at {auth_path}. "
+            "Run `llm codex logout` before importing Codex CLI auth."
+        )
     source_path = Path(path) if path else _codex_cli_auth_path()
-    data = _read_auth(source_path)
+    data = _read_auth(
+        source_path,
+        missing_message=(
+            f"No Codex CLI auth found at {source_path}. "
+            f"{AUTH_RECOVERY_MESSAGE}"
+        ),
+    )
     tokens = dict(data.get("tokens") or {})
     if not tokens.get("access_token"):
         raise BorrowKeyError(f"No access token found in {source_path}.")
     plugin_data = _normalize_auth_data(tokens, "import")
-    auth_path = _auth_path()
     _write_auth(auth_path, plugin_data)
     return auth_path, plugin_data
 
@@ -971,24 +1062,31 @@ def logout():
     if auth_path.exists():
         auth_path.unlink()
         click.echo(f"Deleted {auth_path}")
+    elif _codex_cli_auth_path().exists():
+        raise click.ClickException(
+            "Cannot logout while using read-only Codex CLI auth fallback. "
+            f"Codex CLI auth path: {_codex_cli_auth_path()}. "
+            "Use Codex CLI to manage that file, or create plugin-owned auth with "
+            f"{LOGIN_COMMAND_HELP}."
+        )
     else:
         click.echo(f"No llm-openai-codex auth found at {auth_path}")
 
 
 @codex.command()
 def status():
-    "Show plugin-owned authentication status."
-    auth_path = _auth_path()
+    "Show authentication status."
     try:
-        data = _read_auth(auth_path)
-        _ensure_account_id(data, persist_path=auth_path)
-    except BorrowKeyError:
-        click.echo(f"{AUTH_MISSING_MESSAGE} Auth file path: {auth_path}")
+        auth = _resolve_auth()
+        _ensure_account_id(auth.data, persist_path=auth.account_id_persist_path)
+    except BorrowKeyError as e:
+        click.echo(str(e))
         return
-    tokens = data.get("tokens") or {}
-    click.echo(f"Auth file: {auth_path}")
-    click.echo(f"auth_mode: {data.get('auth_mode') or ''}")
-    click.echo(f"login_type: {data.get('login_type') or ''}")
+    tokens = auth.tokens
+    click.echo(f"Auth source: {auth.label}")
+    click.echo(f"Auth file: {auth.path}")
+    click.echo(f"auth_mode: {auth.data.get('auth_mode') or ''}")
+    click.echo(f"login_type: {auth.data.get('login_type') or ''}")
     click.echo(f"account_id: {tokens.get('account_id') or ''}")
     click.echo(f"access_token: {_redact(tokens.get('access_token'))}")
     click.echo(f"access_token exp: {_exp_status(tokens.get('access_token'))}")
@@ -1008,21 +1106,20 @@ def usage():
 
 @codex.command()
 def refresh():
-    "Refresh the stored access token."
-    auth_path = _auth_path()
+    "Refresh the plugin-owned access token."
     try:
-        data = _read_auth(auth_path)
-        _refresh_auth(data, auth_path)
+        auth = _resolve_auth()
+        _refresh_plugin_auth(auth)
     except BorrowKeyError as e:
         raise click.ClickException(str(e)) from None
-    click.echo(f"Refreshed llm-openai-codex auth at {auth_path}")
+    click.echo(f"Refreshed llm-openai-codex auth at {auth.path}")
 
 
 @codex.command(name="import")
 @click.option(
     "--path",
     "path",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    type=click.Path(dir_okay=False, path_type=Path),
     help="Path to a Codex CLI auth.json file.",
 )
 def import_(path):
