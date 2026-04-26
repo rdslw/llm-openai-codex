@@ -1,14 +1,20 @@
 import base64
+import hashlib
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 from pathlib import Path
+import secrets
 import time
 from datetime import datetime, timezone
-import urllib.request
 import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
 from enum import Enum
 from typing import AsyncGenerator, Iterator, Optional
 
+import click
 import llm
 from llm import AsyncModel, Model, Options, hookimpl
 from llm.utils import simplify_usage_dict
@@ -25,6 +31,10 @@ CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 AUTH_MISSING_MESSAGE = (
     "No llm-openai-codex auth found. Run `llm codex login` or `llm codex import`."
 )
+REDIRECT_URI = "http://localhost:1455/auth/callback"
+DEVICE_VERIFICATION_URL = "https://auth.openai.com/codex/device"
+DEVICE_USER_CODE_URL = "https://auth.openai.com/api/accounts/deviceauth/usercode"
+DEVICE_TOKEN_URL = "https://auth.openai.com/api/accounts/deviceauth/token"
 
 
 class BorrowKeyError(Exception):
@@ -254,6 +264,159 @@ def _import_codex_auth(path=None):
     auth_path = _auth_path()
     _write_auth(auth_path, plugin_data)
     return auth_path, plugin_data
+
+
+def _post_json(url, payload):
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode(errors="replace")
+        try:
+            error_data = json.loads(error_body)
+        except Exception:
+            error_data = {"error": error_body}
+        raise BorrowKeyError(
+            f"Request to {url} failed (HTTP {e.code}): {error_data}"
+        ) from None
+    except urllib.error.URLError as e:
+        raise BorrowKeyError(f"Request to {url} failed: {e}") from None
+
+
+def _pkce_pair():
+    code_verifier = secrets.token_urlsafe(64)
+    digest = hashlib.sha256(code_verifier.encode()).digest()
+    code_challenge = base64.urlsafe_b64encode(digest).decode().rstrip("=")
+    return code_verifier, code_challenge
+
+
+def _exchange_authorization_code(code, code_verifier, redirect_uri=REDIRECT_URI):
+    payload = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": CLIENT_ID,
+        "code_verifier": code_verifier,
+    }
+    if redirect_uri:
+        payload["redirect_uri"] = redirect_uri
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        REFRESH_URL,
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode(errors="replace")
+        raise BorrowKeyError(
+            f"Authorization code exchange failed (HTTP {e.code}): {error_body}"
+        ) from None
+    except urllib.error.URLError as e:
+        raise BorrowKeyError(f"Authorization code exchange failed: {e}") from None
+
+
+def _browser_login():
+    code_verifier, code_challenge = _pkce_pair()
+    state = secrets.token_urlsafe(32)
+    result = {}
+
+    class CallbackHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            query = urllib.parse.parse_qs(parsed.query)
+            if parsed.path != "/auth/callback":
+                self.send_error(404)
+                return
+            if query.get("state", [""])[0] != state:
+                result["error"] = "OAuth state did not match."
+            elif query.get("error"):
+                result["error"] = query.get("error_description", query["error"])[0]
+            else:
+                result["code"] = query.get("code", [""])[0]
+                if not result["code"]:
+                    result["error"] = "OAuth callback did not include a code."
+
+            status = 400 if result.get("error") else 200
+            body = (
+                "Login failed. Return to your terminal."
+                if result.get("error")
+                else "Login complete. Return to your terminal."
+            )
+            self.send_response(status)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(body.encode())
+
+        def log_message(self, format, *args):
+            return
+
+    try:
+        server = HTTPServer(("127.0.0.1", 1455), CallbackHandler)
+    except OSError as e:
+        raise BorrowKeyError(f"Could not start OAuth callback server: {e}") from None
+    server.timeout = 600
+    params = {
+        "response_type": "code",
+        "client_id": CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "scope": "openid profile email offline_access",
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+        "id_token_add_organizations": "true",
+        "codex_cli_simplified_flow": "true",
+    }
+    url = "https://auth.openai.com/oauth/authorize?" + urllib.parse.urlencode(params)
+    click.echo("Open this URL to log in:")
+    click.echo(url)
+    webbrowser.open(url)
+    server.handle_request()
+    server.server_close()
+    if result.get("error"):
+        raise BorrowKeyError(result["error"])
+    if not result.get("code"):
+        raise BorrowKeyError("Timed out waiting for OAuth callback.")
+    return _exchange_authorization_code(result["code"], code_verifier)
+
+
+def _device_code_login():
+    start = _post_json(DEVICE_USER_CODE_URL, {"client_id": CLIENT_ID})
+    device_auth_id = start.get("device_auth_id")
+    user_code = start.get("user_code")
+    interval = int(start.get("interval") or 5)
+    if not device_auth_id or not user_code:
+        raise BorrowKeyError(
+            "Device-code start response did not include device_auth_id and user_code."
+        )
+    click.echo(f"Open {DEVICE_VERIFICATION_URL}")
+    click.echo(f"Enter code: {user_code}")
+    while True:
+        time.sleep(interval)
+        poll = _post_json(DEVICE_TOKEN_URL, {"device_auth_id": device_auth_id})
+        error = poll.get("error") or poll.get("status")
+        if error in ("authorization_pending", "pending"):
+            continue
+        if error == "slow_down":
+            interval += 5
+            continue
+        authorization_code = poll.get("authorization_code")
+        code_verifier = poll.get("code_verifier")
+        if authorization_code and code_verifier:
+            return _exchange_authorization_code(
+                authorization_code,
+                code_verifier,
+                redirect_uri=None,
+            )
+        if error:
+            raise BorrowKeyError(f"Device-code login failed: {error}")
+        raise BorrowKeyError("Device-code token response was not recognized.")
 
 
 # --- Fetch available models from the Codex endpoint ---
@@ -571,8 +734,110 @@ def _attachment(attachment):
     return {"type": "input_image", "image_url": url, "detail": "low"}
 
 
+def _redact(token):
+    if not token:
+        return ""
+    if len(token) <= 14:
+        return token[:4] + "..."
+    return token[:8] + "..." + token[-6:]
+
+
+def _exp_status(token):
+    exp = _jwt_exp(token)
+    if exp is None:
+        return "unknown"
+    iso = datetime.fromtimestamp(exp, timezone.utc).replace(microsecond=0).isoformat()
+    remaining = int(exp - time.time())
+    return f"{iso} ({remaining} seconds remaining)"
+
+
+@click.group()
+def codex():
+    "Manage llm-openai-codex authentication."
+
+
+@codex.command()
+@click.option("--device-code", is_flag=True, help="Use device-code login.")
+def login(device_code):
+    "Authenticate with ChatGPT OAuth and store plugin-owned tokens."
+    try:
+        tokens = _device_code_login() if device_code else _browser_login()
+        login_type = "chatgptDeviceCode" if device_code else "chatgpt"
+        data = _normalize_auth_data(tokens, login_type)
+        auth_path = _auth_path()
+        _write_auth(auth_path, data)
+    except BorrowKeyError as e:
+        raise click.ClickException(str(e)) from None
+    click.echo(f"Saved llm-openai-codex auth to {auth_path}")
+
+
+@codex.command()
+def logout():
+    "Delete plugin-owned authentication."
+    auth_path = _auth_path()
+    if auth_path.exists():
+        auth_path.unlink()
+        click.echo(f"Deleted {auth_path}")
+    else:
+        click.echo(f"No llm-openai-codex auth found at {auth_path}")
+
+
+@codex.command()
+def status():
+    "Show plugin-owned authentication status."
+    auth_path = _auth_path()
+    try:
+        data = _read_auth(auth_path)
+        _ensure_account_id(data, persist_path=auth_path)
+    except BorrowKeyError:
+        click.echo(f"{AUTH_MISSING_MESSAGE} Auth file path: {auth_path}")
+        return
+    tokens = data.get("tokens") or {}
+    click.echo(f"Auth file: {auth_path}")
+    click.echo(f"auth_mode: {data.get('auth_mode') or ''}")
+    click.echo(f"login_type: {data.get('login_type') or ''}")
+    click.echo(f"account_id: {tokens.get('account_id') or ''}")
+    click.echo(f"access_token: {_redact(tokens.get('access_token'))}")
+    click.echo(f"access_token exp: {_exp_status(tokens.get('access_token'))}")
+    if tokens.get("id_token"):
+        click.echo(f"id_token exp: {_exp_status(tokens.get('id_token'))}")
+
+
+@codex.command()
+def refresh():
+    "Refresh the stored access token."
+    auth_path = _auth_path()
+    try:
+        data = _read_auth(auth_path)
+        _refresh_auth(data, auth_path)
+    except BorrowKeyError as e:
+        raise click.ClickException(str(e)) from None
+    click.echo(f"Refreshed llm-openai-codex auth at {auth_path}")
+
+
+@codex.command(name="import")
+@click.option(
+    "--path",
+    "path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Path to a Codex CLI auth.json file.",
+)
+def import_(path):
+    "Import ChatGPT OAuth tokens from Codex CLI auth.json."
+    try:
+        auth_path, _ = _import_codex_auth(path)
+    except BorrowKeyError as e:
+        raise click.ClickException(str(e)) from None
+    click.echo(f"Imported Codex CLI auth to {auth_path}")
+
+
 @hookimpl
-def register_models(register):
+def register_commands(cli):
+    cli.add_command(codex)
+
+
+@hookimpl
+def register_models(register, model_aliases=None):
     model_names = _fetch_codex_models()
     for model_name in model_names:
         register(

@@ -4,6 +4,7 @@ import stat
 import time
 from unittest.mock import patch
 
+from click.testing import CliRunner
 import llm
 import pytest
 
@@ -20,6 +21,7 @@ from llm_openai_codex import (
     _read_auth,
     _refresh_auth,
     _write_auth,
+    codex,
 )
 
 
@@ -228,3 +230,51 @@ def test_refresh_persists_updates(auth_file):
     assert saved["tokens"]["refresh_token"] == "new_refresh"
     assert saved["tokens"]["account_id"] == "acct_refreshed"
     assert saved["last_refresh"]
+
+
+def test_status_missing_auth_exits_cleanly(auth_file):
+    result = CliRunner().invoke(codex, ["status"])
+    assert result.exit_code == 0
+    assert AUTH_MISSING_MESSAGE in result.output
+
+
+def test_logout_removes_file(auth_file):
+    _write_auth(auth_file, {"auth_mode": "chatgpt", "tokens": {"access_token": "x"}})
+    result = CliRunner().invoke(codex, ["logout"])
+    assert result.exit_code == 0
+    assert not auth_file.exists()
+
+
+def test_import_command_copies_auth(auth_file, tmp_path):
+    source = tmp_path / "auth.json"
+    source.write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "access",
+                    "id_token": jwt({"chatgpt_account_id": "acct_cli"}),
+                },
+            }
+        )
+    )
+    result = CliRunner().invoke(codex, ["import", "--path", str(source)])
+    assert result.exit_code == 0, result.output
+    assert json.loads(auth_file.read_text())["tokens"]["account_id"] == "acct_cli"
+
+
+def test_refresh_command_persists_updates(auth_file):
+    _write_auth(
+        auth_file,
+        {
+            "auth_mode": "chatgpt",
+            "tokens": {"access_token": "old", "refresh_token": "refresh"},
+        },
+    )
+    with patch(
+        "llm_openai_codex._refresh",
+        return_value={"access_token": "new", "id_token": jwt({"chatgpt_account_id": "a"})},
+    ):
+        result = CliRunner().invoke(codex, ["refresh"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(auth_file.read_text())["tokens"]["access_token"] == "new"
