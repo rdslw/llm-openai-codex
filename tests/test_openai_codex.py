@@ -20,15 +20,15 @@ def test_models_are_registered():
     model_ids = [model.model_id for model in llm.get_models()]
     # At least the default models should be registered (or fetched ones)
     # Check the prefix is correct
-    codex_models = [m for m in model_ids if m.startswith("openai-codex/")]
+    codex_models = [m for m in model_ids if m.startswith("codex/")]
     assert len(codex_models) > 0
 
 
 def test_model_id_prefix():
     model = CodexResponsesModel("gpt-5.4")
-    assert model.model_id == "openai-codex/gpt-5.4"
+    assert model.model_id == "codex/gpt-5.4"
     assert model.model_name == "gpt-5.4"
-    assert str(model) == "OpenAI Codex: openai-codex/gpt-5.4"
+    assert str(model) == "OpenAI Codex: codex/gpt-5.4"
 
 
 def test_model_needs_no_key():

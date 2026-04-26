@@ -234,7 +234,7 @@ class _SharedCodexResponses:
     needs_key = None  # We get the key from borrow_codex_key
 
     def __init__(self, model_name):
-        self.model_id = "openai-codex/" + model_name
+        self.model_id = "codex/" + model_name
         self.model_name = model_name
         self.can_stream = True
         self.supports_schema = True
