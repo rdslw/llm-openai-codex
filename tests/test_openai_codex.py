@@ -77,6 +77,24 @@ def test_build_kwargs_reasoning_effort():
     assert kwargs["reasoning"] == {"effort": "high"}
 
 
+def test_build_kwargs_verbosity():
+    model = CodexResponsesModel("gpt-5.4")
+    prompt = llm.Prompt(model=model, prompt="Hello")
+    prompt.options = model.Options(verbosity="low")
+    kwargs = model._build_kwargs(prompt, None)
+    assert kwargs["text"]["verbosity"] == "low"
+
+
+def test_build_kwargs_verbosity_and_schema():
+    model = CodexResponsesModel("gpt-5.4")
+    prompt = llm.Prompt(model=model, prompt="Hello")
+    prompt.options = model.Options(verbosity="high")
+    prompt.schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    kwargs = model._build_kwargs(prompt, None)
+    assert kwargs["text"]["verbosity"] == "high"
+    assert kwargs["text"]["format"]["schema"] == prompt.schema
+
+
 def test_fetch_codex_models_fallback():
     with patch(
         "llm_openai_codex.borrow_codex_key",

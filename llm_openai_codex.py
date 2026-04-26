@@ -203,6 +203,12 @@ class ReasoningEffortEnum(str, Enum):
     xhigh = "xhigh"
 
 
+class VerbosityEnum(str, Enum):
+    low = "low"
+    medium = "medium"
+    high = "high"
+
+
 class CodexOptions(Options):
     max_output_tokens: Optional[int] = Field(
         description="Upper bound for tokens in the response.",
@@ -226,6 +232,10 @@ class CodexOptions(Options):
     )
     reasoning_effort: Optional[ReasoningEffortEnum] = Field(
         description="Reasoning effort level: low, medium, high, or xhigh.",
+        default=None,
+    )
+    verbosity: Optional[VerbosityEnum] = Field(
+        description="Controls output verbosity: low, medium, or high.",
         default=None,
     )
 
@@ -353,6 +363,11 @@ class _SharedCodexResponses:
         if reasoning_effort is not None:
             kwargs["reasoning"] = {"effort": reasoning_effort}
 
+        text = {}
+        verbosity = getattr(prompt.options, "verbosity", None)
+        if verbosity is not None:
+            text["verbosity"] = verbosity
+
         if prompt.tools:
             tool_defs = []
             for tool in prompt.tools:
@@ -374,13 +389,13 @@ class _SharedCodexResponses:
             if tool_defs:
                 kwargs["tools"] = tool_defs
         if self.supports_schema and prompt.schema:
-            kwargs["text"] = {
-                "format": {
+            text["format"] = {
                     "type": "json_schema",
                     "name": "output",
                     "schema": prompt.schema,
                 }
-            }
+        if text:
+            kwargs["text"] = text
         return kwargs
 
     def _handle_event(self, event, response):
