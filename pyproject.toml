@@ -1,9 +1,12 @@
 [project]
-name = "llm-openai-via-codex"
+name = "llm-openai-codex"
 version = "0.1a0"
 description = "Access OpenAI models via a Codex subscription"
 readme = "README.md"
-authors = [{name = "Simon Willison"}]
+authors = [
+    {name = "llm-openai-codex contributors"},
+    {name = "Simon Willison"},
+]
 license = "Apache-2.0"
 classifiers = []
 requires-python = ">=3.10"
@@ -20,13 +23,13 @@ build-backend = "setuptools.build_meta"
 package = true
 
 [project.urls]
-Homepage = "https://github.com/simonw/llm-openai-via-codex"
-Changelog = "https://github.com/simonw/llm-openai-via-codex/releases"
-Issues = "https://github.com/simonw/llm-openai-via-codex/issues"
-CI = "https://github.com/simonw/llm-openai-via-codex/actions"
+Homepage = "https://github.com/rdslw/llm-openai-codex"
+Changelog = "https://github.com/rdslw/llm-openai-codex/releases"
+Issues = "https://github.com/rdslw/llm-openai-codex/issues"
+CI = "https://github.com/rdslw/llm-openai-codex/actions"
 
 [project.entry-points.llm]
-openai_via_codex = "llm_openai_via_codex"
+codex = "llm_openai_codex"
 
 [dependency-groups]
 dev = ["pytest"]

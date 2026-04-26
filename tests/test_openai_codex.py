@@ -4,7 +4,7 @@ from unittest.mock import patch
 import llm
 import pytest
 
-from llm_openai_via_codex import (
+from llm_openai_codex import (
     BorrowKeyError,
     CodexResponsesModel,
     _fetch_codex_models,
@@ -13,7 +13,7 @@ from llm_openai_via_codex import (
 
 
 def test_plugin_is_installed():
-    import llm_openai_via_codex
+    import llm_openai_codex
 
 
 def test_models_are_registered():
@@ -79,7 +79,7 @@ def test_build_kwargs_reasoning_effort():
 
 def test_fetch_codex_models_fallback():
     with patch(
-        "llm_openai_via_codex.borrow_codex_key",
+        "llm_openai_codex.borrow_codex_key",
         side_effect=BorrowKeyError("no auth"),
     ):
         models = _fetch_codex_models()
