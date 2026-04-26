@@ -13,7 +13,7 @@ This project is forked from and based on Simon Willison's `llm-openai-via-codex`
 - Explicit `verbosity` option maps to Responses API `text.verbosity`.
 - Extra Responses API options are forwarded when LLM accepts them.
 - Missing `account_id` values are derived from OAuth JWT claims when possible.
-- Added `llm codex usage` showing current codex plan usage
+- Added `llm codex usage` showing current Codex plan usage.
 
 ## Installation
 
@@ -28,8 +28,10 @@ llm install llm-openai-codex
 Authenticate the plugin:
 
 ```bash
-llm codex login
+llm codex login [--device-code]
 ```
+
+You can also import existing Codex CLI ChatGPT OAuth tokens with `llm codex import`.
 
 List available Codex-backed models:
 
@@ -63,6 +65,8 @@ llm codex logout
 
 `llm codex import` copies ChatGPT OAuth tokens from `${CODEX_HOME:-~/.codex}/auth.json` into the plugin-owned `auth-codex.json`. Normal model calls read only the plugin-owned auth file.
 
+When authentication is missing or expired, run `llm codex login [--device-code]` or `llm codex import`.
+
 ## Development
 
 ```bash
@@ -74,5 +78,3 @@ uv run llm codex status
 ## TODO
 
 - Analyze dual-mode auth allowing to work with both auth-codex.json and shared ~/.codex/auth.json from Codex CLI
-- Fix pre-auth error messages to be the same/similar, plus always showing [--device-code] as an option for login
-

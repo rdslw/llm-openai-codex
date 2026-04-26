@@ -29,8 +29,10 @@ CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 REFRESH_SKEW_SECONDS = 30
 CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 CHATGPT_BACKEND_BASE_URL = "https://chatgpt.com/backend-api"
+LOGIN_COMMAND_HELP = "`llm codex login [--device-code]`"
+AUTH_RECOVERY_MESSAGE = f"Run {LOGIN_COMMAND_HELP} or `llm codex import`."
 AUTH_MISSING_MESSAGE = (
-    "No llm-openai-codex auth found. Run `llm codex login` or `llm codex import`."
+    f"No llm-openai-codex auth found. {AUTH_RECOVERY_MESSAGE}"
 )
 REDIRECT_URI = "http://localhost:1455/auth/callback"
 DEVICE_REDIRECT_URI = "https://auth.openai.com/deviceauth/callback"
@@ -67,7 +69,7 @@ def get_codex_key():
     refresh_token = tokens.get("refresh_token")
     if not refresh_token:
         raise BorrowKeyError(
-            "No refresh token available. Run `llm codex login` to re-authenticate."
+            f"No refresh token available. {AUTH_RECOVERY_MESSAGE}"
         )
 
     _refresh_auth(data, auth_path)
@@ -212,7 +214,7 @@ def _refresh(refresh_token):
     ):
         raise BorrowKeyError(
             f"Refresh token is no longer valid ({error_code}). "
-            "Run `llm codex login` to re-authenticate."
+            f"{AUTH_RECOVERY_MESSAGE}"
         ) from None
 
     raise BorrowKeyError(
@@ -225,7 +227,7 @@ def _refresh_auth(data, auth_path=None):
     refresh_token = tokens.get("refresh_token")
     if not refresh_token:
         raise BorrowKeyError(
-            "No refresh token available. Run `llm codex login` to re-authenticate."
+            f"No refresh token available. {AUTH_RECOVERY_MESSAGE}"
         )
     new_tokens = _refresh(refresh_token)
     for token_key in ("access_token", "id_token", "refresh_token"):
@@ -383,6 +385,10 @@ def _browser_login():
 
 
 def _device_code_login():
+    click.echo(
+        "Before continuing, double-check that you have enabled device code "
+        "authorization for Codex in ChatGPT Security Settings."
+    )
     status, start = _post_json_status(DEVICE_USER_CODE_URL, {"client_id": CLIENT_ID})
     if status == 404:
         raise BorrowKeyError(

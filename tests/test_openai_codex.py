@@ -11,6 +11,7 @@ import pytest
 
 from llm_openai_codex import (
     AUTH_MISSING_MESSAGE,
+    AUTH_RECOVERY_MESSAGE,
     BorrowKeyError,
     CodexResponsesModel,
     DEFAULT_MODELS,
@@ -410,6 +411,24 @@ def test_status_missing_auth_exits_cleanly(auth_file):
     result = CliRunner().invoke(codex, ["status"])
     assert result.exit_code == 0
     assert AUTH_MISSING_MESSAGE in result.output
+    assert AUTH_RECOVERY_MESSAGE in result.output
+
+
+def test_missing_refresh_token_uses_common_auth_recovery_message(auth_file):
+    data = {"auth_mode": "chatgpt", "tokens": {"access_token": "expired"}}
+    with pytest.raises(BorrowKeyError) as excinfo:
+        _refresh_auth(data, auth_file)
+    assert AUTH_RECOVERY_MESSAGE in str(excinfo.value)
+
+
+def test_invalid_refresh_token_uses_common_auth_recovery_message():
+    with patch(
+        "llm_openai_codex._post_json_status",
+        return_value=(400, {"error": "refresh_token_expired"}),
+    ):
+        with pytest.raises(BorrowKeyError) as excinfo:
+            _refresh("refresh")
+    assert AUTH_RECOVERY_MESSAGE in str(excinfo.value)
 
 
 def test_logout_removes_file(auth_file):
@@ -454,7 +473,7 @@ def test_refresh_command_persists_updates(auth_file):
     assert json.loads(auth_file.read_text())["tokens"]["access_token"] == "new"
 
 
-def test_device_code_login_matches_codex_flow():
+def test_device_code_login_matches_codex_flow(capsys):
     responses = [
         (
             200,
@@ -481,6 +500,11 @@ def test_device_code_login_matches_codex_flow():
             tokens = _device_code_login()
 
     assert tokens == {"access_token": "access"}
+    output = capsys.readouterr().out
+    assert "enabled device code authorization for Codex" in output
+    assert output.index("enabled device code authorization for Codex") < output.index(
+        "Enter code: CODE-12345"
+    )
     assert post_json.call_args_list[0].args == (
         DEVICE_USER_CODE_URL,
         {"client_id": "app_EMoamEEZ73f0CkXaXp7hrann"},
