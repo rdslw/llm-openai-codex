@@ -1,7 +1,7 @@
 import base64
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from click.testing import CliRunner
@@ -221,7 +221,8 @@ def test_format_usage_shows_limits_and_credits():
             "balance": "12.4",
         },
     }
-    now = datetime(2026, 4, 26, 12, 0, tzinfo=timezone.utc).astimezone()
+    berlin = timezone(timedelta(hours=2))
+    now = datetime(2026, 4, 26, 14, 0, tzinfo=berlin)
     output = _format_usage(payload, now=now)
 
     assert output.startswith(

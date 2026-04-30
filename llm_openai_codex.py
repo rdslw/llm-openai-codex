@@ -644,11 +644,15 @@ def _capitalize_first(value):
 def _reset_label(resets_at, now=None):
     if resets_at is None:
         return None
+    now = now or datetime.now().astimezone()
     try:
-        reset = datetime.fromtimestamp(int(resets_at), timezone.utc).astimezone()
+        # Format reset times in the same timezone used for "now"; otherwise
+        # tests and CI runners in UTC can disagree with a user's local display.
+        reset = datetime.fromtimestamp(int(resets_at), timezone.utc).astimezone(
+            now.tzinfo
+        )
     except (OSError, TypeError, ValueError):
         return None
-    now = now or datetime.now().astimezone()
     if reset.date() == now.date():
         return reset.strftime("%H:%M")
     day = reset.strftime("%d").lstrip("0") or "0"
