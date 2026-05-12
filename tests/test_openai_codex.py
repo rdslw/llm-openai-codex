@@ -26,6 +26,7 @@ from llm_openai_codex import (
     _exchange_authorization_code,
     _fetch_codex_models,
     _import_codex_auth,
+    _model_names_for_registration,
     _fetch_usage,
     _format_usage,
     _post_json_status,
@@ -139,6 +140,17 @@ def test_fetch_codex_models_fallback():
     ):
         models = _fetch_codex_models()
     assert models == DEFAULT_MODELS
+
+
+def test_fallback_models_include_codex_spark():
+    assert "gpt-5.3-codex-spark" in DEFAULT_MODELS
+
+
+def test_model_registration_includes_defaults_when_discovery_succeeds():
+    with patch("llm_openai_codex._fetch_codex_models", return_value=["gpt-test"]):
+        models = _model_names_for_registration()
+    assert models[0] == "gpt-test"
+    assert "gpt-5.3-codex-spark" in models
 
 
 def test_fetch_codex_models_suppresses_default_user_agent():

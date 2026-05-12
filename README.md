@@ -14,6 +14,7 @@ This project is forked from and based on Simon Willison's `llm-openai-via-codex`
 - Extra Responses API options are forwarded when LLM accepts them.
 - Missing `account_id` values are derived from OAuth JWT claims when possible.
 - Added `llm codex usage` showing current Codex plan usage.
+- Registers known hidden/fallback Codex models such as `gpt-5.3-codex-spark`.
 
 ## Installation
 
@@ -39,16 +40,18 @@ List available Codex-backed models:
 llm models -q codex
 ```
 
+Models are discovered from the Codex API, plus known hidden/fallback slugs such as `gpt-5.3-codex-spark`. Some listed fallback models may still fail at request time if your plan lacks access.
+
 Run a prompt:
 
 ```bash
-llm -m codex/gpt-5.5 "Hello"
+llm -m codex/gpt-5.3-codex-spark "Hello"
 ```
 
 Use Responses API verbosity:
 
 ```bash
-llm -m codex/gpt-5.5 -o verbosity low "Summarize this"
+llm -m codex/gpt-5.3-codex-spark -o verbosity low "Summarize this"
 ```
 
 ## Auth commands

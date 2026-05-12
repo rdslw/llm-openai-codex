@@ -535,6 +535,7 @@ DEFAULT_MODELS = [
     "gpt-5.4",
     "gpt-5.4-mini",
     "gpt-5.4-nano",
+    "gpt-5.3-codex-spark",
 ]
 
 
@@ -568,6 +569,16 @@ def _fetch_codex_models():
         ]
     except Exception:
         return DEFAULT_MODELS
+
+
+def _model_names_for_registration():
+    """
+    Return discovered models plus known hidden/fallback model slugs.
+
+    Discovery can omit plan-specific models that are still callable, so register
+    DEFAULT_MODELS too; unavailable models will fail at request time.
+    """
+    return list(dict.fromkeys([*_fetch_codex_models(), *DEFAULT_MODELS]))
 
 
 def _request_json(url, headers):
@@ -1142,7 +1153,7 @@ def register_commands(cli):
 
 @hookimpl
 def register_models(register, model_aliases=None):
-    model_names = _fetch_codex_models()
+    model_names = _model_names_for_registration()
     for model_name in model_names:
         register(
             CodexResponsesModel(model_name),
