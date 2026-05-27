@@ -8,7 +8,7 @@ This project is forked from and based on Simon Willison's `llm-openai-via-codex`
 
 - Package renamed to `llm-openai-codex`.
 - Model prefix changed to `codex/`.
-- Plugin-owned auth is stored in LLM's user config directory as `auth-codex.json`, with read-only fallback to `${CODEX_HOME:-~/.codex}/auth.json`.
+- Plugin-owned auth is stored in LLM's user config directory as `auth-codex.json`, with borrowed fallback to `${CODEX_HOME:-~/.codex}/auth.json`.
 - `llm codex` auth commands manage login, import, status, refresh, and logout.
 - Explicit `verbosity` option maps to Responses API `text.verbosity`.
 - Extra Responses API options are forwarded when LLM accepts them.
@@ -70,7 +70,7 @@ llm codex logout
 Auth source order:
 
 1. Plugin-owned `auth-codex.json`
-2. Read-only Codex CLI auth at `${CODEX_HOME:-~/.codex}/auth.json`
+2. Borrowed Codex CLI auth at `${CODEX_HOME:-~/.codex}/auth.json`
 
 `llm codex import` copies ChatGPT OAuth tokens from Codex CLI auth into plugin-owned `auth-codex.json`. It refuses to overwrite an existing `auth-codex.json`; run `llm codex logout` first if you want to replace plugin-owned auth.
 

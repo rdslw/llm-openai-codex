@@ -69,7 +69,7 @@ class AuthContext:
     @property
     def label(self):
         if self.read_only:
-            return "Codex CLI auth fallback (read-only)"
+            return "Codex CLI borrowed auth"
         return "plugin-owned auth"
 
     @property
@@ -98,8 +98,8 @@ def get_codex_key():
     """
     Return (access_token, account_id) from ChatGPT OAuth credentials.
 
-    Plugin-owned auth is preferred. Codex CLI auth is a read-only fallback and
-    is never refreshed or modified by this plugin.
+    Plugin-owned auth is preferred. Codex CLI auth is a borrowed fallback and
+    is never auto-refreshed (only via `llm codex refresh --borrowed`).
     """
     auth = _resolve_auth()
     tokens = _valid_auth_tokens(auth)
@@ -172,7 +172,7 @@ def _valid_auth_tokens(auth):
 def _refresh_plugin_auth(auth):
     if not auth.refreshable:
         raise BorrowKeyError(
-            f"Borrowed auth at {auth.path} is read-only. "
+            f"Borrowed auth at {auth.path} is not auto-refreshable. "
             "Use `llm codex refresh --borrowed` to refresh it explicitly, "
             "or `llm codex import` to promote it."
         )
@@ -1050,8 +1050,34 @@ def _exp_status(token):
     if exp is None:
         return "unknown"
     iso = datetime.fromtimestamp(exp, timezone.utc).replace(microsecond=0).isoformat()
-    remaining = int(exp - time.time())
-    return f"{iso} ({remaining} seconds remaining)"
+    hours = (exp - time.time()) / 3600
+    return f"{iso} ({hours:.1f} hours remaining)"
+
+
+def _account_info_from_tokens(tokens):
+    """Return (email, plan) extracted from JWT claims; no API calls.
+
+    Prefers access_token (fresher); falls back to id_token. JWT claims remain
+    readable even when the token is expired - we never verify signatures here.
+    """
+    for token_key in ("access_token", "id_token"):
+        token = tokens.get(token_key)
+        if not token:
+            continue
+        payload = _jwt_payload(token) or {}
+        email = payload.get("email")
+        profile = payload.get("https://api.openai.com/profile")
+        if not email and isinstance(profile, dict):
+            email = profile.get("email")
+        auth_claims = payload.get("https://api.openai.com/auth")
+        plan = (
+            auth_claims.get("chatgpt_plan_type")
+            if isinstance(auth_claims, dict)
+            else None
+        )
+        if email or plan:
+            return email, plan
+    return None, None
 
 
 @click.group()
@@ -1083,7 +1109,7 @@ def logout():
         click.echo(f"Deleted {auth_path}")
     elif _codex_cli_auth_path().exists():
         raise click.ClickException(
-            "Cannot logout while using read-only Codex CLI auth fallback. "
+            "Cannot logout from borrowed Codex CLI auth. "
             f"Codex CLI auth path: {_codex_cli_auth_path()}. "
             "Use Codex CLI to manage that file, or create plugin-owned auth with "
             f"{LOGIN_COMMAND_HELP}."
@@ -1104,13 +1130,22 @@ def status():
     tokens = auth.tokens
     click.echo(f"Auth source: {auth.label}")
     click.echo(f"Auth file: {auth.path}")
+    email, plan = _account_info_from_tokens(tokens)
+    if email or plan:
+        suffix = f" ({_capitalize_first(plan)})" if plan else ""
+        click.echo(f"Account: {email or ''}{suffix}")
     click.echo(f"auth_mode: {auth.data.get('auth_mode') or ''}")
-    click.echo(f"login_type: {auth.data.get('login_type') or ''}")
+    login_type = auth.data.get("login_type")
+    if login_type:
+        click.echo(f"login_type: {login_type}")
+    elif auth.read_only:
+        click.echo("login_type: (borrowed, not set by Codex CLI)")
     click.echo(f"account_id: {tokens.get('account_id') or ''}")
     click.echo(f"access_token: {_redact(tokens.get('access_token'))}")
     click.echo(f"access_token exp: {_exp_status(tokens.get('access_token'))}")
-    if tokens.get("id_token"):
-        click.echo(f"id_token exp: {_exp_status(tokens.get('id_token'))}")
+    # id_token exp intentionally not shown: id_token is OIDC identity-only
+    # (consumed at sign-in for profile claims, never sent to APIs). Its
+    # useful claims surface in the `Account:` line above.
 
 
 @codex.command()

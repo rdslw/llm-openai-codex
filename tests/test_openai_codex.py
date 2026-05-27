@@ -19,6 +19,7 @@ from llm_openai_codex import (
     DEVICE_USER_CODE_URL,
     CHATGPT_BACKEND_BASE_URL,
     _account_id_from_token,
+    _account_info_from_tokens,
     _auth_path,
     _codex_cli_auth_path,
     _device_code_login,
@@ -368,7 +369,7 @@ def test_resolve_auth_falls_back_to_codex_cli_auth(auth_file, tmp_path, monkeypa
     auth = _resolve_auth()
 
     assert auth.path == cli_path
-    assert auth.label == "Codex CLI auth fallback (read-only)"
+    assert auth.label == "Codex CLI borrowed auth"
     assert auth.data["tokens"]["access_token"] == "cli"
     assert auth.read_only is True
     assert auth.refreshable is False
@@ -469,6 +470,28 @@ def test_account_id_from_token_claim_order():
     )
     assert _account_id_from_token(jwt({"organizations": [{"id": "org_1"}]})) == "org_1"
     assert _account_id_from_token(jwt({"organization_id": "org_2"})) == "org_2"
+
+
+def test_account_info_from_tokens_extracts_email_and_plan():
+    # access_token: email in namespaced profile claim, plan in auth claim
+    access = jwt({
+        "https://api.openai.com/profile": {"email": "a@example.com"},
+        "https://api.openai.com/auth": {"chatgpt_plan_type": "plus"},
+    })
+    # id_token: top-level email; preferred only when access_token has nothing
+    id_tok = jwt({"email": "fallback@example.com",
+                  "https://api.openai.com/auth": {"chatgpt_plan_type": "pro"}})
+
+    assert _account_info_from_tokens({"access_token": access, "id_token": id_tok}) == (
+        "a@example.com", "plus",
+    )
+    # Falls back to id_token when access_token lacks claims
+    assert _account_info_from_tokens({"access_token": jwt({}), "id_token": id_tok}) == (
+        "fallback@example.com", "pro",
+    )
+    # No tokens / no claims / non-dict auth claim
+    assert _account_info_from_tokens({}) == (None, None)
+    assert _account_info_from_tokens({"access_token": jwt({"https://api.openai.com/auth": "junk"})}) == (None, None)
 
 
 def test_missing_account_id_is_derived_and_persisted(auth_file):
@@ -578,7 +601,7 @@ def test_status_shows_codex_cli_fallback_source(auth_file, tmp_path, monkeypatch
     result = CliRunner().invoke(codex, ["status"])
 
     assert result.exit_code == 0
-    assert "Auth source: Codex CLI auth fallback (read-only)" in result.output
+    assert "Auth source: Codex CLI borrowed auth" in result.output
     assert f"Auth file: {cli_path}" in result.output
     assert "account_id: acct_cli" in result.output
 
@@ -617,7 +640,7 @@ def test_logout_is_disabled_for_codex_cli_fallback(auth_file, tmp_path, monkeypa
     result = CliRunner().invoke(codex, ["logout"])
 
     assert result.exit_code != 0
-    assert "Cannot logout while using read-only Codex CLI auth fallback" in result.output
+    assert "Cannot logout from borrowed Codex CLI auth" in result.output
     assert str(cli_path) in result.output
     assert cli_path.exists()
 
