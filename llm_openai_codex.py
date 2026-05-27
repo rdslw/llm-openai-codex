@@ -36,8 +36,10 @@ AUTH_MISSING_MESSAGE = (
     f"No llm-openai-codex auth found. {AUTH_RECOVERY_MESSAGE}"
 )
 CODEX_CLI_REFRESH_MESSAGE = (
-    "Run Codex CLI to refresh shared Codex CLI tokens, or "
-    f"{AUTH_RECOVERY_MESSAGE}"
+    "Run `llm codex refresh --borrowed` (rotates the shared refresh token; "
+    "restart Codex CLI afterwards), run Codex CLI itself, or "
+    f"{AUTH_RECOVERY_MESSAGE} "
+    "Borrowed auth is never auto-refreshed; refresh must be explicit."
 )
 REDIRECT_URI = "http://localhost:1455/auth/callback"
 DEVICE_REDIRECT_URI = "https://auth.openai.com/deviceauth/callback"
@@ -155,10 +157,12 @@ def _valid_auth_tokens(auth):
     if exp is not None and time.time() < (exp - REFRESH_SKEW_SECONDS):
         return tokens
 
+    # No lazy refresh for borrowed auth: rotating the shared refresh_token
+    # would break a concurrently-running Codex CLI. User must opt in via
+    # `llm codex refresh --borrowed`.
     if not auth.refreshable:
         raise BorrowKeyError(
-            "Codex CLI auth token is expired or cannot be checked, and "
-            "llm-openai-codex will not refresh shared Codex CLI auth. "
+            "Borrowed Codex CLI auth token is expired. "
             f"{CODEX_CLI_REFRESH_MESSAGE}"
         )
     _refresh_plugin_auth(auth)
@@ -168,9 +172,9 @@ def _valid_auth_tokens(auth):
 def _refresh_plugin_auth(auth):
     if not auth.refreshable:
         raise BorrowKeyError(
-            "Cannot refresh while using read-only Codex CLI auth fallback. "
-            f"Codex CLI auth path: {auth.path}. "
-            f"{CODEX_CLI_REFRESH_MESSAGE}"
+            f"Borrowed auth at {auth.path} is read-only. "
+            "Use `llm codex refresh --borrowed` to refresh it explicitly, "
+            "or `llm codex import` to promote it."
         )
     _refresh_auth(auth.data, auth.path)
 
@@ -1120,14 +1124,40 @@ def usage():
 
 
 @codex.command()
-def refresh():
-    "Refresh the plugin-owned access token."
+@click.option(
+    "--borrowed",
+    is_flag=True,
+    help=(
+        "Refresh borrowed Codex CLI auth in place. "
+        "Rotates the shared refresh token; restart Codex CLI afterwards."
+    ),
+)
+def refresh(borrowed):
+    """Refresh the access token. Refresh of borrowed auth is never automatic."""
     try:
         auth = _resolve_auth()
-        _refresh_plugin_auth(auth)
+        if auth.read_only:
+            if not borrowed:
+                raise click.ClickException(
+                    f"Borrowed auth at {auth.path} requires explicit opt-in. "
+                    "Re-run with `--borrowed`, or use `llm codex import` to "
+                    "promote it. Borrowed auth is never auto-refreshed."
+                )
+            click.echo(
+                f"Refreshing borrowed auth at {auth.path}. "
+                "WARNING: rotates the shared refresh_token; restart any "
+                "running Codex CLI sessions afterwards.",
+                err=True,
+            )
+            # User opted in via --borrowed; bypass _refresh_plugin_auth's guard.
+            _refresh_auth(auth.data, auth.path)
+        else:
+            if borrowed:
+                click.echo("--borrowed ignored: plugin-owned auth is active.", err=True)
+            _refresh_plugin_auth(auth)
     except BorrowKeyError as e:
         raise click.ClickException(str(e)) from None
-    click.echo(f"Refreshed llm-openai-codex auth at {auth.path}")
+    click.echo(f"Refreshed Codex auth at {auth.path}")
 
 
 @codex.command(name="import")

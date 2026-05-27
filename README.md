@@ -61,6 +61,7 @@ llm codex login
 llm codex login --device-code
 llm codex status
 llm codex refresh
+llm codex refresh --borrowed
 llm codex usage
 llm codex import
 llm codex logout
@@ -73,7 +74,15 @@ Auth source order:
 
 `llm codex import` copies ChatGPT OAuth tokens from Codex CLI auth into plugin-owned `auth-codex.json`. It refuses to overwrite an existing `auth-codex.json`; run `llm codex logout` first if you want to replace plugin-owned auth.
 
-When using Codex CLI auth fallback, this plugin does not refresh or delete the shared Codex CLI auth file. If those tokens expire, run Codex CLI to refresh them, or run `llm codex login [--device-code]` to create plugin-owned auth. `llm codex status` shows which auth source is active.
+### Refresh behavior
+
+- **Plugin-owned auth** refreshes lazily and on demand via `llm codex refresh`.
+- **Borrowed Codex CLI auth** never refreshes automatically. When it expires, pick one:
+  - `llm codex refresh --borrowed` — refresh the shared file in place. **Rotates the shared `refresh_token`; restart any running Codex CLI session afterwards.**
+  - Run Codex CLI itself to refresh.
+  - `llm codex import` to promote it to plugin-owned auth.
+
+`llm codex status` shows which auth source is active.
 
 When authentication is missing or expired, run `llm codex login [--device-code]` or `llm codex import`.
 

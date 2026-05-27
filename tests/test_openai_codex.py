@@ -426,8 +426,8 @@ def test_get_codex_key_refuses_to_refresh_codex_cli_fallback(
             get_codex_key()
 
     refresh.assert_not_called()
-    assert "will not refresh shared Codex CLI auth" in str(excinfo.value)
-    assert "Run Codex CLI to refresh shared Codex CLI tokens" in str(excinfo.value)
+    assert "Borrowed Codex CLI auth token is expired" in str(excinfo.value)
+    assert "llm codex refresh --borrowed" in str(excinfo.value)
     assert AUTH_RECOVERY_MESSAGE in str(excinfo.value)
 
 
@@ -456,7 +456,7 @@ def test_get_codex_key_reports_missing_codex_cli_access_token(
 
     assert "Codex CLI auth" in str(excinfo.value)
     assert "does not contain an access token" in str(excinfo.value)
-    assert "Run Codex CLI to refresh shared Codex CLI tokens" in str(excinfo.value)
+    assert "llm codex refresh --borrowed" in str(excinfo.value)
 
 
 def test_account_id_from_token_claim_order():
@@ -681,7 +681,7 @@ def test_refresh_command_persists_updates(auth_file):
     assert json.loads(auth_file.read_text())["tokens"]["access_token"] == "new"
 
 
-def test_refresh_command_is_disabled_for_codex_cli_fallback(
+def test_refresh_command_requires_borrowed_flag_for_codex_cli_fallback(
     auth_file, tmp_path, monkeypatch
 ):
     cli_path = write_codex_cli_auth(
@@ -697,10 +697,61 @@ def test_refresh_command_is_disabled_for_codex_cli_fallback(
         result = CliRunner().invoke(codex, ["refresh"])
 
     assert result.exit_code != 0
-    assert "Cannot refresh while using read-only Codex CLI auth fallback" in result.output
+    assert "requires explicit opt-in" in result.output
+    assert "--borrowed" in result.output
+    assert "never auto-refreshed" in result.output
     assert str(cli_path) in result.output
-    assert "Run Codex CLI to refresh shared Codex CLI tokens" in result.output
     refresh.assert_not_called()
+
+
+def test_refresh_command_borrowed_flag_refreshes_codex_cli_fallback(
+    auth_file, tmp_path, monkeypatch
+):
+    cli_path = write_codex_cli_auth(
+        tmp_path,
+        monkeypatch,
+        {
+            "auth_mode": "chatgpt",
+            "tokens": {"access_token": "cli", "refresh_token": "refresh"},
+        },
+    )
+
+    with patch(
+        "llm_openai_codex._refresh",
+        return_value={
+            "access_token": "new_cli",
+            "id_token": jwt({"chatgpt_account_id": "acct_cli"}),
+            "refresh_token": "rotated_refresh",
+        },
+    ):
+        result = CliRunner().invoke(codex, ["refresh", "--borrowed"])
+
+    assert result.exit_code == 0, result.output
+    assert "WARNING" in result.output
+    assert "rotates the shared refresh_token" in result.output
+    assert "restart any running Codex CLI sessions" in result.output
+    assert f"Refreshed Codex auth at {cli_path}" in result.output
+    saved = json.loads(cli_path.read_text())
+    assert saved["tokens"]["access_token"] == "new_cli"
+    assert saved["tokens"]["refresh_token"] == "rotated_refresh"
+
+
+def test_refresh_command_borrowed_flag_is_ignored_for_plugin_owned(auth_file):
+    _write_auth(
+        auth_file,
+        {
+            "auth_mode": "chatgpt",
+            "tokens": {"access_token": "old", "refresh_token": "refresh"},
+        },
+    )
+    with patch(
+        "llm_openai_codex._refresh",
+        return_value={"access_token": "new", "id_token": jwt({"chatgpt_account_id": "a"})},
+    ):
+        result = CliRunner().invoke(codex, ["refresh", "--borrowed"])
+    assert result.exit_code == 0, result.output
+    assert "--borrowed ignored" in result.output
+    assert json.loads(auth_file.read_text())["tokens"]["access_token"] == "new"
 
 
 def test_device_code_login_matches_codex_flow(capsys):
