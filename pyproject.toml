@@ -1,6 +1,6 @@
 [project]
 name = "llm-openai-codex"
-version = "0.2.2"
+version = "0.2.3"
 description = "Access OpenAI models via a Codex subscription"
 readme = "README.md"
 authors = [
