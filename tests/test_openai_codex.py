@@ -134,6 +134,48 @@ def test_build_kwargs_forwards_extra_options():
     assert kwargs["service_tier"] == "flex"
 
 
+def test_build_kwargs_web_search():
+    model = CodexResponsesModel("gpt-5.4")
+    prompt = llm.Prompt(model=model, prompt="Hello")
+    prompt.options = model.Options(
+        web_search=True, web_search_live=True, web_search_context_size="high"
+    )
+    kwargs = model._build_kwargs(prompt, None)
+    assert kwargs["tools"] == [
+        {
+            "type": "web_search",
+            "external_web_access": True,
+            "search_context_size": "high",
+        }
+    ]
+
+
+def test_build_kwargs_web_search_minimal():
+    model = CodexResponsesModel("gpt-5.4")
+    prompt = llm.Prompt(model=model, prompt="Hello")
+    prompt.options = model.Options(web_search=True)
+    kwargs = model._build_kwargs(prompt, None)
+    assert kwargs["tools"] == [{"type": "web_search"}]
+
+
+def test_build_kwargs_no_web_search_by_default():
+    model = CodexResponsesModel("gpt-5.4")
+    prompt = llm.Prompt(model=model, prompt="Hello")
+    kwargs = model._build_kwargs(prompt, None)
+    assert "tools" not in kwargs
+
+
+def test_build_kwargs_web_search_coexists_with_function_tool():
+    model = CodexResponsesModel("gpt-5.4")
+    prompt = llm.Prompt(model=model, prompt="Hello")
+    prompt.options = model.Options(web_search=True)
+    prompt.tools = [llm.Tool(name="my_tool", description="d")]
+    kwargs = model._build_kwargs(prompt, None)
+    assert kwargs["tools"][0] == {"type": "web_search"}
+    assert kwargs["tools"][1]["type"] == "function"
+    assert kwargs["tools"][1]["name"] == "my_tool"
+
+
 def test_fetch_codex_models_fallback():
     with patch(
         "llm_openai_codex.get_codex_key",

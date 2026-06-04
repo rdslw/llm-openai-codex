@@ -778,6 +778,12 @@ class VerbosityEnum(str, Enum):
     high = "high"
 
 
+class WebSearchContextSizeEnum(str, Enum):
+    low = "low"
+    medium = "medium"
+    high = "high"
+
+
 class CodexOptions(Options):
     model_config = ConfigDict(extra="allow")
 
@@ -807,6 +813,21 @@ class CodexOptions(Options):
     )
     verbosity: Optional[VerbosityEnum] = Field(
         description="Controls output verbosity: low, medium, or high.",
+        default=None,
+    )
+    web_search: Optional[bool] = Field(
+        description="Enable OpenAI's server-side web_search tool.",
+        default=None,
+    )
+    web_search_live: Optional[bool] = Field(
+        description=(
+            "Use live internet access for web_search instead of the cached "
+            "index. Maps to the tool's external_web_access flag."
+        ),
+        default=None,
+    )
+    web_search_context_size: Optional[WebSearchContextSizeEnum] = Field(
+        description="web_search context size: low, medium, or high.",
         default=None,
     )
 
@@ -939,8 +960,17 @@ class _SharedCodexResponses:
         if verbosity is not None:
             text["verbosity"] = verbosity
 
+        tool_defs = []
+        if getattr(prompt.options, "web_search", None):
+            web_search_tool = {"type": "web_search"}
+            live = getattr(prompt.options, "web_search_live", None)
+            if live is not None:
+                web_search_tool["external_web_access"] = live
+            context_size = getattr(prompt.options, "web_search_context_size", None)
+            if context_size is not None:
+                web_search_tool["search_context_size"] = context_size
+            tool_defs.append(web_search_tool)
         if prompt.tools:
-            tool_defs = []
             for tool in prompt.tools:
                 if not getattr(tool, "name", None):
                     continue
@@ -957,8 +987,8 @@ class _SharedCodexResponses:
                         "strict": False,
                     }
                 )
-            if tool_defs:
-                kwargs["tools"] = tool_defs
+        if tool_defs:
+            kwargs["tools"] = tool_defs
         if self.supports_schema and prompt.schema:
             text["format"] = {
                     "type": "json_schema",

@@ -2,7 +2,7 @@
 
 LLM plugin for accessing ChatGPT/Codex-backed OpenAI models through the Responses API.
 
-This project is forked from and based on Simon Willison's `llm-openai-via-codex`.
+Fork of Simon Willison's `llm-openai-via-codex` with a `codex/` model prefix, plugin-owned auth, `llm codex` commands, verbosity, and OpenAI's server-side `web_search` tool.
 
 ## Changes from the original plugin
 
@@ -15,6 +15,7 @@ This project is forked from and based on Simon Willison's `llm-openai-via-codex`
 - Missing `account_id` values are derived from OAuth JWT claims when possible.
 - Added `llm codex usage` showing current Codex plan usage.
 - Registers known hidden/fallback Codex models such as `gpt-5.3-codex-spark`.
+- Added OpenAI's server-side `web_search` tool via `-o web_search 1`.
 
 ## Installation
 
@@ -52,6 +53,24 @@ Use Responses API verbosity:
 
 ```bash
 llm -m codex/gpt-5.3-codex-spark -o verbosity low "Summarize this"
+```
+
+## Web search
+
+Enable OpenAI's server-side `web_search` tool (the search runs on OpenAI's servers, not locally):
+
+```bash
+llm -m codex/gpt-5.5 -o web_search 1 "What happened in AI news today?"
+llm -m codex/gpt-5.5 -o web_search 1 -o web_search_live 1 "Latest stable Python release?"
+llm -m codex/gpt-5.5 -o web_search 1 -o web_search_context_size high "Summarize recent LLM benchmarks"
+```
+
+`web_search_live` requests live internet access instead of the cached index; `web_search_context_size` is one of `low`, `medium`, `high`. Availability depends on your plan and model.
+
+To enable web search by default for a given model, use LLM's per-model default options:
+
+```bash
+llm models options set codex/gpt-5.5 web_search 1
 ```
 
 ## Auth commands
@@ -93,3 +112,12 @@ uv run pytest
 uv run llm plugins
 uv run llm codex status
 ```
+
+## Releasing
+
+1. Bump `version` in `pyproject.toml` (PEP 440, no `v` prefix, e.g. `0.2.4`).
+2. Commit, then tag with a `v` prefix and push:
+   ```bash
+   git tag v0.2.4 && git push origin v0.2.4
+   ```
+3. Publish a GitHub Release for that tag (`gh release create v0.2.4 --generate-notes`). This triggers `.github/workflows/publish.yml` to test and publish to PyPI.
