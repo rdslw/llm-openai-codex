@@ -1065,10 +1065,19 @@ class _SharedCodexResponses:
                     )
                 )
 
-        if et == "response.completed":
+        if et in ("response.completed", "response.incomplete", "response.failed"):
             response.response_json = event.response.model_dump()
             self.set_usage(response, event.response.usage)
+            if et == "response.failed":
+                error = getattr(event.response, "error", None)
+                message = getattr(error, "message", None) or "Codex response failed."
+                raise llm.ModelError(message)
             return None
+
+        if et == "error":
+            raise llm.ModelError(
+                getattr(event, "message", None) or "Codex stream returned an error."
+            )
 
 
 class CodexResponsesModel(_SharedCodexResponses, Model):

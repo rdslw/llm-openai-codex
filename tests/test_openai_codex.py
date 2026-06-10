@@ -2,6 +2,7 @@ import base64
 import json
 import time
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from click.testing import CliRunner
@@ -185,6 +186,55 @@ def test_build_kwargs_web_search_coexists_with_function_tool():
     assert kwargs["tools"][0] == {"type": "web_search"}
     assert kwargs["tools"][1]["type"] == "function"
     assert kwargs["tools"][1]["name"] == "my_tool"
+
+
+class RecordingResponse:
+    """Stand-in for llm's Response in _handle_event tests."""
+
+    def __init__(self):
+        self.response_json = None
+        self.usage = None
+
+    def set_usage(self, input=None, output=None, details=None):
+        self.usage = (input, output, details)
+
+
+def test_handle_event_failed_raises_model_error():
+    model = CodexResponsesModel("gpt-5.4")
+    event = SimpleNamespace(
+        type="response.failed",
+        response=SimpleNamespace(
+            usage=None,
+            error=SimpleNamespace(message="quota exceeded"),
+            model_dump=lambda: {"status": "failed"},
+        ),
+    )
+    response = RecordingResponse()
+    with pytest.raises(llm.ModelError, match="quota exceeded"):
+        model._handle_event(event, response)
+    assert response.response_json == {"status": "failed"}
+
+
+def test_handle_event_incomplete_records_response_and_usage():
+    model = CodexResponsesModel("gpt-5.4")
+    event = SimpleNamespace(
+        type="response.incomplete",
+        response=SimpleNamespace(
+            usage={"input_tokens": 1, "output_tokens": 2},
+            model_dump=lambda: {"status": "incomplete"},
+        ),
+    )
+    response = RecordingResponse()
+    assert model._handle_event(event, response) is None
+    assert response.response_json == {"status": "incomplete"}
+    assert response.usage == (1, 2, {})
+
+
+def test_handle_event_error_event_raises_model_error():
+    model = CodexResponsesModel("gpt-5.4")
+    event = SimpleNamespace(type="error", message="bad request", code="server_error")
+    with pytest.raises(llm.ModelError, match="bad request"):
+        model._handle_event(event, RecordingResponse())
 
 
 def test_fetch_codex_models_returns_none_without_auth():
