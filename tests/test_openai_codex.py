@@ -23,6 +23,7 @@ from llm_openai_codex import (
     _account_id_from_token,
     _account_info_from_tokens,
     _auth_path,
+    _browser_login,
     _cached_codex_models,
     _codex_cli_auth_path,
     _device_code_login,
@@ -1018,6 +1019,51 @@ def test_refresh_command_borrowed_flag_is_ignored_for_plugin_owned(auth_file):
     assert result.exit_code == 0, result.output
     assert "--borrowed ignored" in result.output
     assert json.loads(auth_file.read_text())["tokens"]["access_token"] == "new"
+
+
+def test_browser_login_survives_stray_requests(monkeypatch):
+    import threading
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    opened = {}
+    monkeypatch.setattr(
+        "llm_openai_codex.webbrowser.open", lambda url: opened.setdefault("url", url)
+    )
+    exchanged = {}
+
+    def fake_exchange(code, code_verifier, redirect_uri=None):
+        exchanged["code"] = code
+        return {"access_token": "access"}
+
+    monkeypatch.setattr(
+        "llm_openai_codex._exchange_authorization_code", fake_exchange
+    )
+
+    result = {}
+
+    def run():
+        result["tokens"] = _browser_login()
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    for _ in range(200):
+        if "url" in opened:
+            break
+        time.sleep(0.05)
+    state = urllib.parse.parse_qs(urllib.parse.urlparse(opened["url"]).query)["state"][0]
+
+    with pytest.raises(urllib.error.HTTPError):
+        urllib.request.urlopen("http://127.0.0.1:1455/favicon.ico", timeout=5)
+    urllib.request.urlopen(
+        f"http://127.0.0.1:1455/auth/callback?code=abc&state={state}", timeout=5
+    )
+
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert result["tokens"] == {"access_token": "access"}
+    assert exchanged["code"] == "abc"
 
 
 def test_device_code_login_matches_codex_flow(capsys):

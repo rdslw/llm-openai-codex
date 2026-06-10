@@ -443,7 +443,7 @@ def _browser_login():
         server = HTTPServer(("127.0.0.1", 1455), CallbackHandler)
     except OSError as e:
         raise BorrowKeyError(f"Could not start OAuth callback server: {e}") from None
-    server.timeout = 600
+    server.timeout = 30  # wake periodically so the deadline below is enforced
     params = {
         "response_type": "code",
         "client_id": CLIENT_ID,
@@ -459,7 +459,11 @@ def _browser_login():
     click.echo("Open this URL to log in:")
     click.echo(url)
     webbrowser.open(url)
-    server.handle_request()
+    # Stray requests (favicon, browser preflight) get a 404 in the handler
+    # and must not abort the wait for the real callback.
+    deadline = time.monotonic() + 600
+    while not result and time.monotonic() < deadline:
+        server.handle_request()
     server.server_close()
     if result.get("error"):
         raise BorrowKeyError(result["error"])
