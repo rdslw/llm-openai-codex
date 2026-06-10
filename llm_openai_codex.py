@@ -179,8 +179,11 @@ def _read_auth(path, missing_message=None):
     path = Path(path)
     if not path.exists():
         raise BorrowKeyError(missing_message or AUTH_MISSING_MESSAGE)
-    with path.open() as f:
-        data = json.load(f)
+    try:
+        with path.open() as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        raise BorrowKeyError(f"Invalid JSON in auth file {path}: {e}") from None
     if data.get("auth_mode") != "chatgpt":
         raise BorrowKeyError(
             f"Expected auth_mode 'chatgpt', got '{data.get('auth_mode')}'. "
@@ -893,8 +896,8 @@ class _SharedCodexResponses:
             return
         if not isinstance(usage, dict):
             usage = usage.model_dump()
-        input_tokens = usage.pop("input_tokens")
-        output_tokens = usage.pop("output_tokens")
+        input_tokens = usage.pop("input_tokens", None)
+        output_tokens = usage.pop("output_tokens", None)
         usage.pop("total_tokens", None)
         response.set_usage(
             input=input_tokens, output=output_tokens, details=simplify_usage_dict(usage)

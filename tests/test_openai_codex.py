@@ -192,11 +192,13 @@ def test_build_kwargs_web_search_coexists_with_function_tool():
 class FakePrevResponse:
     """Stand-in for a logged llm Response in conversation history."""
 
-    def __init__(self, prompt_text, text="", tool_calls=None, tool_results=None):
+    def __init__(
+        self, prompt_text, text="", tool_calls=None, tool_results=None, attachments=None
+    ):
         self.prompt = SimpleNamespace(
             prompt=prompt_text, tool_results=tool_results or []
         )
-        self.attachments = []
+        self.attachments = attachments or []
         self._text = text
         self._tool_calls = tool_calls or []
 
@@ -264,9 +266,104 @@ class RecordingResponse:
     def __init__(self):
         self.response_json = None
         self.usage = None
+        self.tool_calls = []
 
     def set_usage(self, input=None, output=None, details=None):
         self.usage = (input, output, details)
+
+    def add_tool_call(self, tool_call):
+        self.tool_calls.append(tool_call)
+
+
+def test_build_messages_with_attachments_in_history_and_prompt():
+    model = CodexResponsesModel("gpt-5.4")
+    image = SimpleNamespace(url="https://example.com/old.png")
+    conversation = SimpleNamespace(
+        responses=[
+            FakePrevResponse("Look at this", text="Nice.", attachments=[image])
+        ]
+    )
+    prompt = llm.Prompt(model=model, prompt="And this?")
+    prompt.attachments = [SimpleNamespace(url="https://example.com/new.png")]
+    messages = model._build_messages(prompt, conversation)
+    assert messages == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Look at this"},
+                {
+                    "type": "input_image",
+                    "image_url": "https://example.com/old.png",
+                    "detail": "low",
+                },
+            ],
+        },
+        {"role": "assistant", "content": "Nice."},
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "And this?"},
+                {
+                    "type": "input_image",
+                    "image_url": "https://example.com/new.png",
+                    "detail": "low",
+                },
+            ],
+        },
+    ]
+
+
+def test_handle_event_output_text_delta_returns_delta():
+    model = CodexResponsesModel("gpt-5.4")
+    event = SimpleNamespace(type="response.output_text.delta", delta="Hel")
+    assert model._handle_event(event, RecordingResponse()) == "Hel"
+
+
+def test_handle_event_function_call_adds_tool_call():
+    model = CodexResponsesModel("gpt-5.4")
+    event = SimpleNamespace(
+        type="response.output_item.done",
+        item={
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "get_time",
+            "arguments": '{"tz": "UTC"}',
+        },
+    )
+    response = RecordingResponse()
+    assert model._handle_event(event, response) is None
+    assert len(response.tool_calls) == 1
+    assert response.tool_calls[0].tool_call_id == "call_1"
+    assert response.tool_calls[0].name == "get_time"
+    assert response.tool_calls[0].arguments == {"tz": "UTC"}
+
+
+def test_handle_event_completed_sets_response_json_and_usage():
+    model = CodexResponsesModel("gpt-5.4")
+    event = SimpleNamespace(
+        type="response.completed",
+        response=SimpleNamespace(
+            usage={"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
+            model_dump=lambda: {"status": "completed"},
+        ),
+    )
+    response = RecordingResponse()
+    assert model._handle_event(event, response) is None
+    assert response.response_json == {"status": "completed"}
+    assert response.usage == (7, 3, {})
+
+
+def test_set_usage_tolerates_missing_token_fields():
+    model = CodexResponsesModel("gpt-5.4")
+    response = RecordingResponse()
+    model.set_usage(response, {"output_tokens": 5})
+    assert response.usage == (None, 5, {})
+
+
+def test_read_auth_reports_invalid_json(auth_file):
+    auth_file.write_text("{not json")
+    with pytest.raises(BorrowKeyError, match="Invalid JSON in auth file"):
+        _read_auth(auth_file)
 
 
 def test_handle_event_failed_raises_model_error():
