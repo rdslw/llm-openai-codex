@@ -541,17 +541,18 @@ DEFAULT_MODELS = [
     "gpt-5.4-nano",
     "gpt-5.3-codex-spark",
 ]
+MODELS_CACHE_TTL = 24 * 60 * 60  # seconds
 
 
 def _fetch_codex_models():
     """
     Fetch the list of available models from the Codex endpoint.
-    Returns a list of model slug strings. Falls back to DEFAULT_MODELS on error.
+    Returns a list of model slug strings, or None when auth or the fetch fails.
     """
     try:
         token, account_id = get_codex_key()
     except BorrowKeyError:
-        return DEFAULT_MODELS
+        return None
 
     headers = {"Authorization": f"Bearer {token}"}
     if account_id:
@@ -564,7 +565,7 @@ def _fetch_codex_models():
     )
 
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
         return [
             m["slug"]
@@ -572,7 +573,38 @@ def _fetch_codex_models():
             if m.get("supported_in_api") and m.get("visibility") == "list"
         ]
     except Exception:
-        return DEFAULT_MODELS
+        return None
+
+
+def _models_cache_path():
+    return llm.user_dir() / "codex_models.json"
+
+
+def _cached_codex_models():
+    """
+    Return the discovered model list, fetching at most once per MODELS_CACHE_TTL.
+
+    A stale cache still beats no data when the fetch fails; returns None only
+    when there is no cache and the fetch fails too.
+    """
+    path = _models_cache_path()
+    cached = None
+    try:
+        data = json.loads(path.read_text())
+        if isinstance(data.get("models"), list):
+            cached = data["models"]
+            if time.time() - data.get("fetched_at", 0) < MODELS_CACHE_TTL:
+                return cached
+    except Exception:
+        pass
+    models = _fetch_codex_models()
+    if models is None:
+        return cached
+    try:
+        path.write_text(json.dumps({"fetched_at": time.time(), "models": models}))
+    except OSError:
+        pass
+    return models
 
 
 def _model_names_for_registration():
@@ -582,13 +614,13 @@ def _model_names_for_registration():
     Discovery can omit plan-specific models that are still callable, so register
     DEFAULT_MODELS too; unavailable models will fail at request time.
     """
-    return list(dict.fromkeys([*_fetch_codex_models(), *DEFAULT_MODELS]))
+    return list(dict.fromkeys([*(_cached_codex_models() or []), *DEFAULT_MODELS]))
 
 
 def _request_json(url, headers):
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=20) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         error_body = e.read().decode(errors="replace")

@@ -43,6 +43,8 @@ llm models -q codex
 
 Models are discovered from the Codex API, plus known hidden/fallback slugs such as `gpt-5.3-codex-spark`. Some listed fallback models may still fail at request time if your plan lacks access.
 
+The discovered list is cached for 24 hours in `codex_models.json` in LLM's user config directory; delete that file to force a re-fetch.
+
 Run a prompt:
 
 ```bash

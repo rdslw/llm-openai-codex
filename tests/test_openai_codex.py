@@ -18,9 +18,11 @@ from llm_openai_codex import (
     DEVICE_TOKEN_URL,
     DEVICE_USER_CODE_URL,
     CHATGPT_BACKEND_BASE_URL,
+    MODELS_CACHE_TTL,
     _account_id_from_token,
     _account_info_from_tokens,
     _auth_path,
+    _cached_codex_models,
     _codex_cli_auth_path,
     _device_code_login,
     _ensure_account_id,
@@ -28,12 +30,14 @@ from llm_openai_codex import (
     _fetch_codex_models,
     _import_codex_auth,
     _model_names_for_registration,
+    _models_cache_path,
     _fetch_usage,
     _format_usage,
     _post_json_status,
     _read_auth,
     _refresh,
     _refresh_auth,
+    _request_json,
     _resolve_auth,
     _write_auth,
     get_codex_key,
@@ -44,6 +48,13 @@ from llm_openai_codex import (
 def jwt(payload):
     body = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
     return f"header.{body}.signature"
+
+
+@pytest.fixture(autouse=True)
+def user_dir(tmp_path, monkeypatch):
+    path = tmp_path / "llm-user-dir"
+    monkeypatch.setenv("LLM_USER_PATH", str(path))
+    return path
 
 
 @pytest.fixture
@@ -176,13 +187,58 @@ def test_build_kwargs_web_search_coexists_with_function_tool():
     assert kwargs["tools"][1]["name"] == "my_tool"
 
 
-def test_fetch_codex_models_fallback():
+def test_fetch_codex_models_returns_none_without_auth():
     with patch(
         "llm_openai_codex.get_codex_key",
         side_effect=BorrowKeyError("no auth"),
     ):
         models = _fetch_codex_models()
+    assert models is None
+
+
+def test_model_registration_falls_back_to_defaults():
+    with patch("llm_openai_codex._fetch_codex_models", return_value=None):
+        models = _model_names_for_registration()
     assert models == DEFAULT_MODELS
+
+
+def test_cached_models_skip_fetch_while_fresh():
+    _models_cache_path().write_text(
+        json.dumps({"fetched_at": time.time(), "models": ["gpt-cached"]})
+    )
+    with patch("llm_openai_codex._fetch_codex_models") as fetch:
+        models = _cached_codex_models()
+    fetch.assert_not_called()
+    assert models == ["gpt-cached"]
+
+
+def test_stale_cache_is_refetched_and_rewritten():
+    _models_cache_path().write_text(
+        json.dumps(
+            {
+                "fetched_at": time.time() - MODELS_CACHE_TTL - 1,
+                "models": ["gpt-stale"],
+            }
+        )
+    )
+    with patch("llm_openai_codex._fetch_codex_models", return_value=["gpt-fresh"]):
+        models = _cached_codex_models()
+    assert models == ["gpt-fresh"]
+    assert json.loads(_models_cache_path().read_text())["models"] == ["gpt-fresh"]
+
+
+def test_stale_cache_beats_failed_fetch():
+    _models_cache_path().write_text(
+        json.dumps(
+            {
+                "fetched_at": time.time() - MODELS_CACHE_TTL - 1,
+                "models": ["gpt-stale"],
+            }
+        )
+    )
+    with patch("llm_openai_codex._fetch_codex_models", return_value=None):
+        models = _cached_codex_models()
+    assert models == ["gpt-stale"]
 
 
 def test_fallback_models_include_codex_spark():
@@ -219,8 +275,9 @@ def test_fetch_codex_models_suppresses_default_user_agent():
 
     captured = {}
 
-    def fake_urlopen(req):
+    def fake_urlopen(req, timeout):
         captured["headers"] = dict(req.header_items())
+        captured["timeout"] = timeout
         return FakeResponse()
 
     with patch("llm_openai_codex.get_codex_key", return_value=("token", "acct")):
@@ -228,9 +285,34 @@ def test_fetch_codex_models_suppresses_default_user_agent():
             models = _fetch_codex_models()
 
     assert models == ["gpt-test"]
+    assert captured["timeout"] == 10
     assert captured["headers"]["Authorization"] == "Bearer token"
     assert captured["headers"]["Chatgpt-account-id"] == "acct"
     assert captured["headers"]["User-agent"] == ""
+
+
+def test_request_json_sets_timeout():
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self):
+            return b'{"ok": true}'
+
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    with patch("llm_openai_codex.urllib.request.urlopen", fake_urlopen):
+        data = _request_json("https://example.com", {})
+
+    assert data == {"ok": True}
+    assert captured["timeout"] == 20
 
 
 def test_fetch_usage_uses_wham_usage_endpoint_and_auth_headers():
