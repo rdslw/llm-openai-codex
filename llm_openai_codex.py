@@ -106,10 +106,6 @@ def get_codex_key():
     return tokens["access_token"], tokens.get("account_id")
 
 
-# Backwards-compatible alias for callers that imported the old helper.
-borrow_codex_key = get_codex_key
-
-
 def _auth_path():
     override = os.environ.get("LLM_OPENAI_CODEX_AUTH_FILE")
     if override:
@@ -346,13 +342,6 @@ def _import_codex_auth(path=None):
     plugin_data = _normalize_auth_data(tokens, "import")
     _write_auth(auth_path, plugin_data)
     return auth_path, plugin_data
-
-
-def _post_json(url, payload):
-    status, data = _post_json_status(url, payload)
-    if 200 <= status < 300:
-        return data
-    raise BorrowKeyError(f"Request to {url} failed (HTTP {status}): {data}")
 
 
 def _post_json_status(url, payload):
@@ -920,9 +909,11 @@ class _SharedCodexResponses:
                     for attachment in prev_response.attachments:
                         attachment_message.append(_attachment(attachment))
                     messages.append({"role": "user", "content": attachment_message})
-                else:
+                elif prev_response.prompt.prompt or not getattr(
+                    prev_response.prompt, "tool_results", None
+                ):
                     messages.append(
-                        {"role": "user", "content": prev_response.prompt.prompt}
+                        {"role": "user", "content": prev_response.prompt.prompt or ""}
                     )
                 for tool_result in getattr(prev_response.prompt, "tool_results", []):
                     if not tool_result.tool_call_id:
@@ -948,15 +939,17 @@ class _SharedCodexResponses:
                                 "arguments": json.dumps(tool_call.arguments),
                             }
                         )
-        if not prompt.attachments:
-            messages.append({"role": "user", "content": prompt.prompt or ""})
-        else:
+        if prompt.attachments:
             attachment_message = []
             if prompt.prompt:
                 attachment_message.append({"type": "input_text", "text": prompt.prompt})
             for attachment in prompt.attachments:
                 attachment_message.append(_attachment(attachment))
             messages.append({"role": "user", "content": attachment_message})
+        elif prompt.prompt or not getattr(prompt, "tool_results", None):
+            # Tool-result-only turns must not inject an empty user message
+            # between function_call and function_call_output items.
+            messages.append({"role": "user", "content": prompt.prompt or ""})
         for tool_result in getattr(prompt, "tool_results", []):
             if not tool_result.tool_call_id:
                 continue

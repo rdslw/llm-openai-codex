@@ -188,6 +188,75 @@ def test_build_kwargs_web_search_coexists_with_function_tool():
     assert kwargs["tools"][1]["name"] == "my_tool"
 
 
+class FakePrevResponse:
+    """Stand-in for a logged llm Response in conversation history."""
+
+    def __init__(self, prompt_text, text="", tool_calls=None, tool_results=None):
+        self.prompt = SimpleNamespace(
+            prompt=prompt_text, tool_results=tool_results or []
+        )
+        self.attachments = []
+        self._text = text
+        self._tool_calls = tool_calls or []
+
+    def text_or_raise(self):
+        return self._text
+
+    def tool_calls_or_raise(self):
+        return self._tool_calls
+
+
+def test_build_messages_skips_empty_user_turn_with_tool_results():
+    model = CodexResponsesModel("gpt-5.4")
+    prompt = llm.Prompt(model=model, prompt="")
+    prompt.tool_results = [
+        llm.ToolResult(name="get_time", output="noon", tool_call_id="call_1")
+    ]
+    messages = model._build_messages(prompt, None)
+    assert messages == [
+        {"type": "function_call_output", "call_id": "call_1", "output": "noon"}
+    ]
+
+
+def test_build_messages_replays_tool_loop_history_without_empty_user_turns():
+    model = CodexResponsesModel("gpt-5.4")
+    conversation = SimpleNamespace(
+        responses=[
+            FakePrevResponse(
+                "What time?",
+                tool_calls=[
+                    llm.ToolCall(
+                        tool_call_id="call_1", name="get_time", arguments={}
+                    )
+                ],
+            ),
+            FakePrevResponse(
+                None,
+                text="It is noon.",
+                tool_results=[
+                    llm.ToolResult(
+                        name="get_time", output="noon", tool_call_id="call_1"
+                    )
+                ],
+            ),
+        ]
+    )
+    prompt = llm.Prompt(model=model, prompt="Thanks!")
+    messages = model._build_messages(prompt, conversation)
+    assert messages == [
+        {"role": "user", "content": "What time?"},
+        {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "get_time",
+            "arguments": "{}",
+        },
+        {"type": "function_call_output", "call_id": "call_1", "output": "noon"},
+        {"role": "assistant", "content": "It is noon."},
+        {"role": "user", "content": "Thanks!"},
+    ]
+
+
 class RecordingResponse:
     """Stand-in for llm's Response in _handle_event tests."""
 

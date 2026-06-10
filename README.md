@@ -57,6 +57,8 @@ Use Responses API verbosity:
 llm -m codex/gpt-5.3-codex-spark -o verbosity low "Summarize this"
 ```
 
+Image attachments (`-a image.png`) are sent at low detail to limit token use.
+
 ## Web search
 
 Enable OpenAI's server-side `web_search` tool (the search runs on OpenAI's servers, not locally):
