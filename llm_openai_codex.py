@@ -35,11 +35,13 @@ AUTH_RECOVERY_MESSAGE = f"Run {LOGIN_COMMAND_HELP} or `llm codex import`."
 AUTH_MISSING_MESSAGE = (
     f"No llm-openai-codex auth found. {AUTH_RECOVERY_MESSAGE}"
 )
-CODEX_CLI_REFRESH_MESSAGE = (
-    "Run `llm codex refresh --borrowed` (rotates the shared refresh token; "
-    "restart Codex CLI afterwards), run Codex CLI itself, or "
-    f"{AUTH_RECOVERY_MESSAGE} "
-    "Borrowed auth is never auto-refreshed; refresh must be explicit."
+# Auto-refreshing borrowed auth rotates the refresh_token shared with Codex CLI
+# (confirmed: the token endpoint always issues a new one), which invalidates a
+# concurrently-running CLI session — recoverable on its next start. Warn so the
+# user knows to restart it.
+BORROWED_REFRESH_WARNING = (
+    "Refreshed shared Codex CLI auth; its refresh token was rotated. "
+    "Restart any running Codex CLI session."
 )
 REDIRECT_URI = "http://localhost:1455/auth/callback"
 DEVICE_REDIRECT_URI = "https://auth.openai.com/deviceauth/callback"
@@ -63,10 +65,6 @@ class AuthContext:
         return self.data.get("tokens") or {}
 
     @property
-    def account_id_persist_path(self):
-        return None if self.read_only else self.path
-
-    @property
     def label(self):
         if self.read_only:
             return "Codex CLI borrowed auth"
@@ -78,19 +76,10 @@ class AuthContext:
             return "Codex CLI auth"
         return "Plugin-owned auth"
 
-    @property
-    def refreshable(self):
-        return not self.read_only
-
     def missing_access_token_message(self):
-        if self.refreshable:
-            return (
-                f"{self.name} at {self.path} does not contain an access token. "
-                f"{AUTH_RECOVERY_MESSAGE}"
-            )
         return (
             f"{self.name} at {self.path} does not contain an access token. "
-            f"{CODEX_CLI_REFRESH_MESSAGE}"
+            f"{AUTH_RECOVERY_MESSAGE}"
         )
 
 
@@ -98,8 +87,8 @@ def get_codex_key():
     """
     Return (access_token, account_id) from ChatGPT OAuth credentials.
 
-    Plugin-owned auth is preferred. Codex CLI auth is a borrowed fallback and
-    is never auto-refreshed (only via `llm codex refresh --borrowed`).
+    Plugin-owned auth is preferred; Codex CLI auth is a borrowed fallback. Both
+    auto-refresh in place when the access token expires.
     """
     auth = _resolve_auth()
     tokens = _valid_auth_tokens(auth)
@@ -147,32 +136,19 @@ def _valid_auth_tokens(auth):
     if not tokens.get("access_token"):
         raise BorrowKeyError(auth.missing_access_token_message())
 
-    _ensure_account_id(auth.data, persist_path=auth.account_id_persist_path)
+    _ensure_account_id(auth.data, persist_path=None if auth.read_only else auth.path)
 
     exp = _jwt_exp(tokens["access_token"])
     if exp is not None and time.time() < (exp - REFRESH_SKEW_SECONDS):
         return tokens
 
-    # No lazy refresh for borrowed auth: rotating the shared refresh_token
-    # would break a concurrently-running Codex CLI. User must opt in via
-    # `llm codex refresh --borrowed`.
-    if not auth.refreshable:
-        raise BorrowKeyError(
-            "Borrowed Codex CLI auth token is expired. "
-            f"{CODEX_CLI_REFRESH_MESSAGE}"
-        )
-    _refresh_plugin_auth(auth)
-    return auth.tokens
-
-
-def _refresh_plugin_auth(auth):
-    if not auth.refreshable:
-        raise BorrowKeyError(
-            f"Borrowed auth at {auth.path} is not auto-refreshable. "
-            "Use `llm codex refresh --borrowed` to refresh it explicitly, "
-            "or `llm codex import` to promote it."
-        )
+    # Refresh in place for both sources; the expiry gate above means this fires
+    # only when the token is essentially dead, i.e. when Codex CLI would refresh
+    # anyway, so a borrowed rotation rarely collides with a live CLI session.
+    if auth.read_only:
+        click.echo(BORROWED_REFRESH_WARNING, err=True)
     _refresh_auth(auth.data, auth.path)
+    return auth.tokens
 
 
 def _read_auth(path, missing_message=None):
@@ -1194,7 +1170,7 @@ def status():
     "Show authentication status."
     try:
         auth = _resolve_auth()
-        _ensure_account_id(auth.data, persist_path=auth.account_id_persist_path)
+        _ensure_account_id(auth.data, persist_path=None if auth.read_only else auth.path)
     except BorrowKeyError as e:
         click.echo(str(e))
         return
@@ -1230,37 +1206,13 @@ def usage():
 
 
 @codex.command()
-@click.option(
-    "--borrowed",
-    is_flag=True,
-    help=(
-        "Refresh borrowed Codex CLI auth in place. "
-        "Rotates the shared refresh token; restart Codex CLI afterwards."
-    ),
-)
-def refresh(borrowed):
-    """Refresh the access token. Refresh of borrowed auth is never automatic."""
+def refresh():
+    "Refresh the access token (borrowed Codex CLI auth refreshes in place too)."
     try:
         auth = _resolve_auth()
         if auth.read_only:
-            if not borrowed:
-                raise click.ClickException(
-                    f"Borrowed auth at {auth.path} requires explicit opt-in. "
-                    "Re-run with `--borrowed`, or use `llm codex import` to "
-                    "promote it. Borrowed auth is never auto-refreshed."
-                )
-            click.echo(
-                f"Refreshing borrowed auth at {auth.path}. "
-                "WARNING: rotates the shared refresh_token; restart any "
-                "running Codex CLI sessions afterwards.",
-                err=True,
-            )
-            # User opted in via --borrowed; bypass _refresh_plugin_auth's guard.
-            _refresh_auth(auth.data, auth.path)
-        else:
-            if borrowed:
-                click.echo("--borrowed ignored: plugin-owned auth is active.", err=True)
-            _refresh_plugin_auth(auth)
+            click.echo(BORROWED_REFRESH_WARNING, err=True)
+        _refresh_auth(auth.data, auth.path)
     except BorrowKeyError as e:
         raise click.ClickException(str(e)) from None
     click.echo(f"Refreshed Codex auth at {auth.path}")

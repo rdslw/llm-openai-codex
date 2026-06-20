@@ -697,7 +697,6 @@ def test_resolve_auth_uses_plugin_auth_first(auth_file, tmp_path, monkeypatch):
     assert auth.label == "plugin-owned auth"
     assert auth.data["tokens"]["access_token"] == "plugin"
     assert auth.read_only is False
-    assert auth.refreshable is True
 
 
 def test_resolve_auth_falls_back_to_codex_cli_auth(auth_file, tmp_path, monkeypatch):
@@ -713,7 +712,6 @@ def test_resolve_auth_falls_back_to_codex_cli_auth(auth_file, tmp_path, monkeypa
     assert auth.label == "Codex CLI borrowed auth"
     assert auth.data["tokens"]["access_token"] == "cli"
     assert auth.read_only is True
-    assert auth.refreshable is False
 
 
 def test_existing_invalid_plugin_auth_does_not_fall_back_to_codex_cli(
@@ -750,11 +748,11 @@ def test_get_codex_key_uses_codex_cli_fallback_without_persisting(
     assert "account_id" not in saved["tokens"]
 
 
-def test_get_codex_key_refuses_to_refresh_codex_cli_fallback(
+def test_get_codex_key_auto_refreshes_codex_cli_fallback(
     auth_file, tmp_path, monkeypatch
 ):
     token = jwt({"exp": int(time.time()) - 10})
-    write_codex_cli_auth(
+    cli_path = write_codex_cli_auth(
         tmp_path,
         monkeypatch,
         {
@@ -763,14 +761,19 @@ def test_get_codex_key_refuses_to_refresh_codex_cli_fallback(
         },
     )
 
-    with patch("llm_openai_codex._refresh") as refresh:
-        with pytest.raises(BorrowKeyError) as excinfo:
-            get_codex_key()
+    new_token = jwt({"exp": int(time.time()) + 3600, "chatgpt_account_id": "acct_new"})
+    with patch(
+        "llm_openai_codex._refresh",
+        return_value={"access_token": new_token, "refresh_token": "rotated"},
+    ) as refresh:
+        access_token, account_id = get_codex_key()
 
-    refresh.assert_not_called()
-    assert "Borrowed Codex CLI auth token is expired" in str(excinfo.value)
-    assert "llm codex refresh --borrowed" in str(excinfo.value)
-    assert AUTH_RECOVERY_MESSAGE in str(excinfo.value)
+    refresh.assert_called_once_with("refresh")
+    assert (access_token, account_id) == (new_token, "acct_new")
+    # Borrowed auth is refreshed in place, persisting the rotated refresh token.
+    saved = json.loads(cli_path.read_text())
+    assert saved["tokens"]["access_token"] == new_token
+    assert saved["tokens"]["refresh_token"] == "rotated"
 
 
 def test_get_codex_key_reports_missing_plugin_access_token(auth_file):
@@ -798,7 +801,7 @@ def test_get_codex_key_reports_missing_codex_cli_access_token(
 
     assert "Codex CLI auth" in str(excinfo.value)
     assert "does not contain an access token" in str(excinfo.value)
-    assert "llm codex refresh --borrowed" in str(excinfo.value)
+    assert AUTH_RECOVERY_MESSAGE in str(excinfo.value)
 
 
 def test_account_id_from_token_claim_order():
@@ -1045,30 +1048,7 @@ def test_refresh_command_persists_updates(auth_file):
     assert json.loads(auth_file.read_text())["tokens"]["access_token"] == "new"
 
 
-def test_refresh_command_requires_borrowed_flag_for_codex_cli_fallback(
-    auth_file, tmp_path, monkeypatch
-):
-    cli_path = write_codex_cli_auth(
-        tmp_path,
-        monkeypatch,
-        {
-            "auth_mode": "chatgpt",
-            "tokens": {"access_token": "cli", "refresh_token": "refresh"},
-        },
-    )
-
-    with patch("llm_openai_codex._refresh") as refresh:
-        result = CliRunner().invoke(codex, ["refresh"])
-
-    assert result.exit_code != 0
-    assert "requires explicit opt-in" in result.output
-    assert "--borrowed" in result.output
-    assert "never auto-refreshed" in result.output
-    assert str(cli_path) in result.output
-    refresh.assert_not_called()
-
-
-def test_refresh_command_borrowed_flag_refreshes_codex_cli_fallback(
+def test_refresh_command_refreshes_codex_cli_fallback_in_place(
     auth_file, tmp_path, monkeypatch
 ):
     cli_path = write_codex_cli_auth(
@@ -1088,34 +1068,14 @@ def test_refresh_command_borrowed_flag_refreshes_codex_cli_fallback(
             "refresh_token": "rotated_refresh",
         },
     ):
-        result = CliRunner().invoke(codex, ["refresh", "--borrowed"])
+        result = CliRunner().invoke(codex, ["refresh"])
 
     assert result.exit_code == 0, result.output
-    assert "WARNING" in result.output
-    assert "rotates the shared refresh_token" in result.output
-    assert "restart any running Codex CLI sessions" in result.output
+    assert "Restart any running Codex CLI session" in result.output
     assert f"Refreshed Codex auth at {cli_path}" in result.output
     saved = json.loads(cli_path.read_text())
     assert saved["tokens"]["access_token"] == "new_cli"
     assert saved["tokens"]["refresh_token"] == "rotated_refresh"
-
-
-def test_refresh_command_borrowed_flag_is_ignored_for_plugin_owned(auth_file):
-    _write_auth(
-        auth_file,
-        {
-            "auth_mode": "chatgpt",
-            "tokens": {"access_token": "old", "refresh_token": "refresh"},
-        },
-    )
-    with patch(
-        "llm_openai_codex._refresh",
-        return_value={"access_token": "new", "id_token": jwt({"chatgpt_account_id": "a"})},
-    ):
-        result = CliRunner().invoke(codex, ["refresh", "--borrowed"])
-    assert result.exit_code == 0, result.output
-    assert "--borrowed ignored" in result.output
-    assert json.loads(auth_file.read_text())["tokens"]["access_token"] == "new"
 
 
 def test_browser_login_survives_stray_requests(monkeypatch):

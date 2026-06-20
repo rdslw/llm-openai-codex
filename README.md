@@ -84,7 +84,6 @@ llm codex login
 llm codex login --device-code
 llm codex status
 llm codex refresh
-llm codex refresh --borrowed
 llm codex usage
 llm codex import
 llm codex logout
@@ -99,11 +98,9 @@ Auth source order:
 
 ### Refresh behavior
 
-- **Plugin-owned auth** refreshes lazily and on demand via `llm codex refresh`.
-- **Borrowed Codex CLI auth** never refreshes automatically. When it expires, pick one:
-  - `llm codex refresh --borrowed` — refresh the shared file in place. **Rotates the shared `refresh_token`; restart any running Codex CLI session afterwards.**
-  - Run Codex CLI itself to refresh.
-  - `llm codex import` to promote it to plugin-owned auth.
+Both auth sources refresh lazily (when the access token nears expiry) and on demand via `llm codex refresh`. Each refresh also rotates the stored `refresh_token` — the server returns a new one that replaces the old, which is then invalidated.
+
+Refreshing **borrowed Codex CLI auth** rotates the `refresh_token` shared with Codex CLI, which can disrupt a Codex CLI session running at the same time (it recovers on its next start); the plugin prints a warning when this happens. Run `llm codex import` to promote the tokens to plugin-owned auth and avoid sharing the file.
 
 `llm codex status` shows which auth source is active.
 
