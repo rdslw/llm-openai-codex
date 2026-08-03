@@ -458,15 +458,21 @@ def test_stale_cache_beats_failed_fetch():
     assert models == ["gpt-stale"]
 
 
-def test_fallback_models_include_codex_spark():
-    assert "gpt-5.3-codex-spark" in DEFAULT_MODELS
+def test_fallback_models_include_known_models():
+    assert {
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.3-codex-spark",
+    } <= set(DEFAULT_MODELS)
 
 
 def test_model_registration_includes_defaults_when_discovery_succeeds():
     with patch("llm_openai_codex._fetch_codex_models", return_value=["gpt-test"]):
         models = _model_names_for_registration()
     assert models[0] == "gpt-test"
-    assert "gpt-5.3-codex-spark" in models
+    assert models[1:] == DEFAULT_MODELS
 
 
 def test_fetch_codex_models_suppresses_default_user_agent():
