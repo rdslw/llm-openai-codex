@@ -57,5 +57,6 @@
 ## Releasing
 
 - Finish and verify feature/fix commits before changing the version.
-- Put the `pyproject.toml` version bump in a separate `bump: vX.Y.Z` commit.
-- Tag the bump commit, then push the branch and tag before creating the release.
+- Complete the whole flow: separate `bump: vX.Y.Z` commit changing
+  `pyproject.toml`, tag that commit, push the branch and tag, then run
+  `gh release create vX.Y.Z --generate-notes` to trigger PyPI publication.

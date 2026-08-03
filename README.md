@@ -119,6 +119,10 @@ uv run llm codex status
 ## Releasing
 
 1. Finish and verify the feature/fix commits.
-2. Bump `version` in `pyproject.toml` (without `v`), then commit it separately: `git add pyproject.toml && git commit -m "bump: v0.4.2"`.
-3. Tag and push that commit: `git tag v0.4.2 && git push origin main v0.4.2`.
-4. Run `gh release create v0.4.2 --generate-notes`; publication triggers testing and PyPI publication.
+2. Bump `pyproject.toml` and commit it separately:
+   `git add pyproject.toml && git commit -m "bump: v0.5.0"`.
+3. Tag and push: `git tag v0.5.0 && git push origin main v0.5.0`.
+4. Create the release: `gh release create v0.5.0 --generate-notes`.
+
+The whole flow is version commit, tag, push, then GitHub Release. The release
+triggers testing and PyPI publication.
