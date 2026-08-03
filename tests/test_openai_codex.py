@@ -982,6 +982,21 @@ def test_logout_removes_file(auth_file):
     assert not auth_file.exists()
 
 
+def test_codex_help_describes_logout_as_local_only():
+    result = CliRunner().invoke(codex, ["--help"])
+
+    assert result.exit_code == 0
+    assert "Delete plugin auth locally; no HTTP API request." in result.output
+    assert (
+        "Copy local or remote Codex auth into plugin owned storage."
+        in result.output
+    )
+    assert (
+        "Refresh plugin or borrowed CLI auth in place (not SCP ones)."
+        in result.output
+    )
+
+
 def test_logout_is_disabled_for_codex_cli_fallback(auth_file, tmp_path, monkeypatch):
     cli_path = write_codex_cli_auth(
         tmp_path,
@@ -1097,6 +1112,7 @@ def test_scp_import_uses_exact_arguments_and_stores_non_refreshable_snapshot(
     run.assert_called_once_with(
         [
             "scp",
+            "-q",
             "--",
             "alice@example.com:.codex/auth.json",
             downloaded_paths[0],

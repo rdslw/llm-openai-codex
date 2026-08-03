@@ -390,7 +390,7 @@ def _read_scp_auth(target):
         downloaded_path = Path(temp_dir) / "auth.json"
         try:
             subprocess.run(
-                ["scp", "--", remote_source, str(downloaded_path)],
+                ["scp", "-q", "--", remote_source, str(downloaded_path)],
                 check=True,
             )
         except FileNotFoundError:
@@ -1289,9 +1289,9 @@ def login(device_code):
     click.echo(f"Saved llm-openai-codex auth to {auth_path}")
 
 
-@codex.command()
+@codex.command(short_help="Delete plugin auth locally; no HTTP API request.")
 def logout():
-    "Delete plugin-owned authentication."
+    "Delete plugin-owned authentication; local rm only, no HTTP API request."
     auth_path = _auth_path()
     if auth_path.exists():
         auth_path.unlink()
@@ -1349,7 +1349,9 @@ def usage():
     click.echo(_format_usage(payload))
 
 
-@codex.command()
+@codex.command(
+    short_help="Refresh plugin or borrowed CLI auth in place (not SCP ones)."
+)
 def refresh():
     "Refresh the access token (borrowed Codex CLI auth refreshes in place too)."
     try:
@@ -1362,7 +1364,10 @@ def refresh():
     click.echo(f"Refreshed Codex auth at {auth.path}")
 
 
-@codex.command(name="import")
+@codex.command(
+    name="import",
+    short_help="Copy local or remote Codex auth into plugin owned storage.",
+)
 @click.option(
     "--path",
     "path",
