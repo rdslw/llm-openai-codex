@@ -2,9 +2,12 @@ import base64
 import hashlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
+import math
 import os
 from pathlib import Path
 import secrets
+import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -43,6 +46,7 @@ BORROWED_REFRESH_WARNING = (
     "Refreshed shared Codex CLI auth; its refresh token was rotated. "
     "Restart any running Codex CLI session."
 )
+SCP_REIMPORT_HELP = "Repeat `llm codex import --path HOST:` to update it."
 REDIRECT_URI = "http://localhost:1455/auth/callback"
 DEVICE_REDIRECT_URI = "https://auth.openai.com/deviceauth/callback"
 DEVICE_VERIFICATION_URL = "https://auth.openai.com/codex/device"
@@ -87,8 +91,9 @@ def get_codex_key():
     """
     Return (access_token, account_id) from ChatGPT OAuth credentials.
 
-    Plugin-owned auth is preferred; Codex CLI auth is a borrowed fallback. Both
-    auto-refresh in place when the access token expires.
+    Plugin-owned auth is preferred; Codex CLI auth is a borrowed fallback.
+    Refreshable credentials auto-refresh in place when the access token expires;
+    SCP snapshots are used unchanged until their access token expires.
     """
     auth = _resolve_auth()
     tokens = _valid_auth_tokens(auth)
@@ -139,6 +144,14 @@ def _valid_auth_tokens(auth):
     _ensure_account_id(auth.data, persist_path=None if auth.read_only else auth.path)
 
     exp = _jwt_exp(tokens["access_token"])
+    if _is_scp_snapshot(auth.data):
+        if exp is None or time.time() < exp:
+            return tokens
+        raise BorrowKeyError(
+            "SCP-imported auth is a non-refreshable access-token snapshot and "
+            f"has expired. {SCP_REIMPORT_HELP}"
+        )
+
     if exp is not None and time.time() < (exp - REFRESH_SKEW_SECONDS):
         return tokens
 
@@ -151,19 +164,32 @@ def _valid_auth_tokens(auth):
     return auth.tokens
 
 
-def _read_auth(path, missing_message=None):
+def _read_auth(path, missing_message=None, source_label=None):
     path = Path(path)
+    display_path = source_label or path
     if not path.exists():
         raise BorrowKeyError(missing_message or AUTH_MISSING_MESSAGE)
     try:
         with path.open() as f:
             data = json.load(f)
     except json.JSONDecodeError as e:
-        raise BorrowKeyError(f"Invalid JSON in auth file {path}: {e}") from None
+        raise BorrowKeyError(f"Invalid JSON in auth file {display_path}: {e}") from None
+    except (OSError, UnicodeError) as e:
+        raise BorrowKeyError(f"Could not read auth file {display_path}: {e}") from None
+    if not isinstance(data, dict):
+        raise BorrowKeyError(
+            f"Invalid auth data in {display_path}: expected a JSON object."
+        )
     if data.get("auth_mode") != "chatgpt":
         raise BorrowKeyError(
             f"Expected auth_mode 'chatgpt', got '{data.get('auth_mode')}'. "
+            f"Auth file: {display_path}. "
             "This library only supports ChatGPT OAuth tokens."
+        )
+    if "tokens" in data and not isinstance(data["tokens"], dict):
+        raise BorrowKeyError(
+            f"Invalid auth data in {display_path}: expected 'tokens' to be a "
+            "JSON object."
         )
     return data
 
@@ -188,7 +214,8 @@ def _jwt_payload(token):
     try:
         payload_b64 = token.split(".")[1]
         payload_b64 += "=" * (-len(payload_b64) % 4)
-        return json.loads(base64.urlsafe_b64decode(payload_b64))
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        return payload if isinstance(payload, dict) else None
     except Exception:
         return None
 
@@ -196,7 +223,13 @@ def _jwt_payload(token):
 def _jwt_exp(token):
     payload = _jwt_payload(token)
     if payload:
-        return payload.get("exp")
+        exp = payload.get("exp")
+        if (
+            isinstance(exp, (int, float))
+            and not isinstance(exp, bool)
+            and math.isfinite(exp)
+        ):
+            return exp
     return None
 
 
@@ -255,6 +288,10 @@ def _normalize_auth_data(tokens, login_type):
     return data
 
 
+def _is_scp_snapshot(data):
+    return data.get("login_type") == "scp"
+
+
 def _refresh(refresh_token):
     payload = {
         "client_id": CLIENT_ID,
@@ -282,6 +319,11 @@ def _refresh(refresh_token):
 
 
 def _refresh_auth(data, auth_path=None):
+    if _is_scp_snapshot(data):
+        raise BorrowKeyError(
+            "SCP-imported auth is a non-refreshable access-token snapshot. "
+            f"{SCP_REIMPORT_HELP}"
+        )
     tokens = data.get("tokens") or {}
     refresh_token = tokens.get("refresh_token")
     if not refresh_token:
@@ -300,26 +342,122 @@ def _refresh_auth(data, auth_path=None):
     return data
 
 
+def _scp_replacement_error(auth_path, reason):
+    return BorrowKeyError(
+        f"Plugin-owned auth already exists at {auth_path} and cannot be safely "
+        f"replaced by an SCP snapshot because {reason}. Inspect it with "
+        "`llm codex status` and remove it with `llm codex logout` only if "
+        "replacement is intended."
+    )
+
+
+def _auth_file_state(auth_path):
+    try:
+        stat = auth_path.stat()
+    except FileNotFoundError:
+        return None
+    return (
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+    )
+
+
+def _check_scp_replacement(auth_path):
+    try:
+        existing = _read_auth(auth_path)
+    except BorrowKeyError:
+        raise _scp_replacement_error(
+            auth_path, "the existing auth could not be validated"
+        ) from None
+    tokens = existing.get("tokens") or {}
+    if tokens.get("refresh_token"):
+        raise _scp_replacement_error(auth_path, "it contains a refresh token")
+    exp = _jwt_exp(tokens.get("access_token"))
+    if exp is None:
+        raise _scp_replacement_error(
+            auth_path, "its access-token expiry cannot be decoded"
+        )
+    if time.time() < exp:
+        raise _scp_replacement_error(auth_path, "its access token has not expired")
+
+
+def _read_scp_auth(target):
+    remote_source = f"{target}.codex/auth.json"
+    with tempfile.TemporaryDirectory(prefix="llm-openai-codex-import-") as temp_dir:
+        downloaded_path = Path(temp_dir) / "auth.json"
+        try:
+            subprocess.run(
+                ["scp", "--", remote_source, str(downloaded_path)],
+                check=True,
+            )
+        except FileNotFoundError:
+            raise BorrowKeyError(
+                "Could not run scp because the system `scp` executable was not found."
+            ) from None
+        except subprocess.CalledProcessError as e:
+            raise BorrowKeyError(
+                f"scp failed while copying {remote_source} (exit status {e.returncode})."
+            ) from None
+        except OSError as e:
+            raise BorrowKeyError(f"Could not run scp: {e}.") from None
+        return _read_auth(
+            downloaded_path,
+            missing_message=f"scp did not download auth from {remote_source}.",
+            source_label=remote_source,
+        )
+
+
 def _import_codex_auth(path=None):
     auth_path = _auth_path()
-    if auth_path.exists():
+    is_scp = path is not None and str(path).endswith(":")
+    initial_auth_state = _auth_file_state(auth_path)
+    replacing_expired_snapshot = False
+    if initial_auth_state is not None and is_scp:
+        _check_scp_replacement(auth_path)
+        replacing_expired_snapshot = True
+    elif initial_auth_state is not None:
         raise BorrowKeyError(
             f"Plugin-owned auth already exists at {auth_path}. "
             "Run `llm codex logout` before importing Codex CLI auth."
         )
-    source_path = Path(path) if path else _codex_cli_auth_path()
-    data = _read_auth(
-        source_path,
-        missing_message=(
-            f"No Codex CLI auth found at {source_path}. "
-            f"{AUTH_RECOVERY_MESSAGE}"
-        ),
-    )
+    if is_scp:
+        source_path = str(path)
+        data = _read_scp_auth(source_path)
+    else:
+        source_path = Path(path) if path else _codex_cli_auth_path()
+        scp_syntax_hint = ""
+        if path is not None and ":" in str(path):
+            scp_syntax_hint = (
+                " Remote imports only support `HOST:` or `USER@HOST:` and "
+                "always read `~/.codex/auth.json`; arbitrary remote paths are "
+                "not supported."
+            )
+        data = _read_auth(
+            source_path,
+            missing_message=(
+                f"No Codex CLI auth found at {source_path}. "
+                f"{AUTH_RECOVERY_MESSAGE}{scp_syntax_hint}"
+            ),
+        )
     tokens = dict(data.get("tokens") or {})
     if not tokens.get("access_token"):
         raise BorrowKeyError(f"No access token found in {source_path}.")
-    plugin_data = _normalize_auth_data(tokens, "import")
+    login_type = "scp" if is_scp else "import"
+    if is_scp:
+        tokens.pop("refresh_token", None)
+    plugin_data = _normalize_auth_data(tokens, login_type)
+    if is_scp and _auth_file_state(auth_path) != initial_auth_state:
+        raise BorrowKeyError(
+            f"Plugin-owned auth at {auth_path} changed while scp was running; "
+            "the downloaded snapshot was not installed. Inspect the current "
+            "auth with `llm codex status` before trying again."
+        )
     _write_auth(auth_path, plugin_data)
+    if replacing_expired_snapshot:
+        click.echo(f"Replaced expired non-refreshable auth at {auth_path}")
     return auth_path, plugin_data
 
 
@@ -1192,6 +1330,8 @@ def status():
     elif auth.read_only:
         click.echo("login_type: (borrowed, not set by Codex CLI)")
     click.echo(f"account_id: {tokens.get('account_id') or ''}")
+    refreshable = bool(tokens.get("refresh_token")) and not _is_scp_snapshot(auth.data)
+    click.echo(f"refreshable: {'yes' if refreshable else 'no'}")
     click.echo(f"access_token: {_redact(tokens.get('access_token'))}")
     click.echo(f"access_token exp: {_exp_status(tokens.get('access_token'))}")
     # id_token exp intentionally not shown: id_token is OIDC identity-only
@@ -1226,11 +1366,11 @@ def refresh():
 @click.option(
     "--path",
     "path",
-    type=click.Path(dir_okay=False, path_type=Path),
-    help="Path to a Codex CLI auth.json file.",
+    type=click.Path(dir_okay=False),
+    help="Local Codex auth.json path, or an SSH target ending in ':' for SCP.",
 )
 def import_(path):
-    "Import ChatGPT OAuth tokens from Codex CLI auth.json."
+    "Import ChatGPT OAuth tokens from a local or remote Codex auth.json."
     try:
         auth_path, _ = _import_codex_auth(path)
     except BorrowKeyError as e:

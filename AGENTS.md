@@ -32,8 +32,15 @@
 - Borrowed auth is used only when plugin-owned auth does not exist.
 - Import copies Codex CLI tokens into plugin-owned storage; it is not a new OAuth
   authorization.
+- SCP imports copy only the fixed remote `~/.codex/auth.json`, discard the
+  refresh token, and remain non-refreshable snapshots. Never replace existing
+  plugin auth unless it has no refresh token and its access-token JWT has a
+  decodable, expired expiry; perform that check before invoking `scp` and
+  preserve existing auth on every transfer or validation failure.
 - Refresh rotates the refresh token. A borrowed refresh writes the shared Codex
   CLI auth file and must retain its user-facing warning.
+- Logout deletes local plugin-owned auth only; it does not revoke tokens or
+  modify borrowed or remote auth.
 - Never expose complete tokens in output, logs, fixtures, or test failures.
 - Tests must use temporary auth paths and mocked network calls, never real user
   credentials or live OAuth flows.

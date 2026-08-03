@@ -1,7 +1,9 @@
 import base64
 import json
+import subprocess
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -1035,6 +1037,402 @@ def test_import_command_reports_missing_codex_cli_auth(auth_file, tmp_path):
     assert result.exit_code != 0
     assert f"No Codex CLI auth found at {source}" in result.output
     assert AUTH_RECOVERY_MESSAGE in result.output
+
+
+def test_missing_colon_path_includes_remote_syntax_hint(auth_file):
+    result = CliRunner().invoke(
+        codex, ["import", "--path", "host:subdir/auth.json"]
+    )
+
+    assert result.exit_code != 0
+    assert "No Codex CLI auth found at host:subdir/auth.json" in result.output
+    assert "Remote imports only support `HOST:` or `USER@HOST:`" in result.output
+    assert "arbitrary remote paths are not supported" in result.output
+
+
+def test_existing_local_colon_path_remains_a_local_import(auth_file, tmp_path):
+    source = tmp_path / "auth:copy.json"
+    source.write_text(
+        json.dumps({"auth_mode": "chatgpt", "tokens": {"access_token": "local"}})
+    )
+
+    result = CliRunner().invoke(codex, ["import", "--path", str(source)])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(auth_file.read_text())["tokens"]["access_token"] == "local"
+
+
+def test_scp_import_uses_exact_arguments_and_stores_non_refreshable_snapshot(
+    auth_file,
+):
+    access_token = jwt(
+        {
+            "exp": int(time.time()) + 3600,
+            "chatgpt_account_id": "acct_remote",
+        }
+    )
+    downloaded_paths = []
+
+    def fake_scp(args, check):
+        downloaded_path = args[-1]
+        downloaded_paths.append(downloaded_path)
+        with open(downloaded_path, "w") as fp:
+            json.dump(
+                {
+                    "auth_mode": "chatgpt",
+                    "tokens": {
+                        "access_token": access_token,
+                        "refresh_token": "must-not-be-copied",
+                    },
+                },
+                fp,
+            )
+
+    with patch("llm_openai_codex.subprocess.run", side_effect=fake_scp) as run:
+        result = CliRunner().invoke(
+            codex, ["import", "--path", "alice@example.com:"]
+        )
+
+    assert result.exit_code == 0, result.output
+    run.assert_called_once_with(
+        [
+            "scp",
+            "--",
+            "alice@example.com:.codex/auth.json",
+            downloaded_paths[0],
+        ],
+        check=True,
+    )
+    assert not Path(downloaded_paths[0]).parent.exists()
+    saved = json.loads(auth_file.read_text())
+    assert saved["login_type"] == "scp"
+    assert saved["tokens"]["access_token"] == access_token
+    assert saved["tokens"]["account_id"] == "acct_remote"
+    assert "refresh_token" not in saved["tokens"]
+
+
+def test_scp_import_reports_missing_scp_executable(auth_file):
+    with patch(
+        "llm_openai_codex.subprocess.run", side_effect=FileNotFoundError
+    ) as run:
+        result = CliRunner().invoke(codex, ["import", "--path", "example.com:"])
+
+    assert result.exit_code != 0
+    assert "system `scp` executable was not found" in result.output
+    assert not auth_file.exists()
+    run.assert_called_once()
+
+
+def test_scp_import_reports_failed_process(auth_file):
+    with patch(
+        "llm_openai_codex.subprocess.run",
+        side_effect=subprocess.CalledProcessError(255, ["scp"]),
+    ):
+        result = CliRunner().invoke(codex, ["import", "--path", "example.com:"])
+
+    assert result.exit_code != 0
+    assert "scp failed" in result.output
+    assert "exit status 255" in result.output
+    assert not auth_file.exists()
+
+
+def test_scp_import_reports_missing_download(auth_file):
+    with patch("llm_openai_codex.subprocess.run"):
+        result = CliRunner().invoke(codex, ["import", "--path", "example.com:"])
+
+    assert result.exit_code != 0
+    assert "scp did not download auth from example.com:.codex/auth.json" in result.output
+    assert not auth_file.exists()
+
+
+def test_scp_import_rejects_invalid_download(auth_file):
+    def fake_scp(args, check):
+        Path(args[-1]).write_text("{not json")
+
+    with patch("llm_openai_codex.subprocess.run", side_effect=fake_scp):
+        result = CliRunner().invoke(codex, ["import", "--path", "example.com:"])
+
+    assert result.exit_code != 0
+    assert "Invalid JSON in auth file" in result.output
+    assert "example.com:.codex/auth.json" in result.output
+    assert "llm-openai-codex-import-" not in result.output
+    assert not auth_file.exists()
+
+
+def test_scp_import_wrong_auth_mode_names_remote_source(auth_file):
+    def fake_scp(args, check):
+        Path(args[-1]).write_text(
+            json.dumps({"auth_mode": "api", "tokens": {"access_token": "remote"}})
+        )
+
+    with patch("llm_openai_codex.subprocess.run", side_effect=fake_scp):
+        result = CliRunner().invoke(codex, ["import", "--path", "example.com:"])
+
+    assert result.exit_code != 0
+    assert "Expected auth_mode 'chatgpt'" in result.output
+    assert "example.com:.codex/auth.json" in result.output
+    assert "llm-openai-codex-import-" not in result.output
+    assert not auth_file.exists()
+
+
+def test_scp_import_safely_replaces_expired_non_refreshable_auth(auth_file):
+    old_token = jwt({"exp": int(time.time()) - 60})
+    new_token = jwt({"exp": int(time.time()) + 3600})
+    _write_auth(
+        auth_file,
+        {
+            "auth_mode": "chatgpt",
+            "login_type": "scp",
+            "tokens": {"access_token": old_token},
+        },
+    )
+
+    def fake_scp(args, check):
+        Path(args[-1]).write_text(
+            json.dumps(
+                {"auth_mode": "chatgpt", "tokens": {"access_token": new_token}}
+            )
+        )
+
+    with patch("llm_openai_codex.subprocess.run", side_effect=fake_scp):
+        result = CliRunner().invoke(codex, ["import", "--path", "example.com:"])
+
+    assert result.exit_code == 0, result.output
+    assert f"Replaced expired non-refreshable auth at {auth_file}" in result.output
+    saved = json.loads(auth_file.read_text())
+    assert saved["login_type"] == "scp"
+    assert saved["tokens"]["access_token"] == new_token
+
+
+@pytest.mark.parametrize(
+    ("tokens", "reason"),
+    (
+        (
+            {
+                "access_token": jwt({"exp": int(time.time()) - 60}),
+                "refresh_token": "still-refreshable",
+            },
+            "contains a refresh token",
+        ),
+        ({"access_token": "not-a-jwt"}, "expiry cannot be decoded"),
+        (
+            {"access_token": jwt({"exp": int(time.time()) + 3600})},
+            "has not expired",
+        ),
+    ),
+)
+def test_scp_import_rejects_unsafe_existing_auth_before_scp(
+    auth_file, tokens, reason
+):
+    _write_auth(auth_file, {"auth_mode": "chatgpt", "tokens": tokens})
+    original = auth_file.read_bytes()
+
+    with patch("llm_openai_codex.subprocess.run") as run:
+        result = CliRunner().invoke(codex, ["import", "--path", "example.com:"])
+
+    assert result.exit_code != 0
+    assert str(auth_file) in result.output
+    assert reason in result.output
+    assert "`llm codex status`" in result.output
+    assert "`llm codex logout` only if replacement is intended" in result.output
+    assert auth_file.read_bytes() == original
+    run.assert_not_called()
+
+
+def test_scp_import_rejects_unreadable_existing_auth_before_scp(auth_file):
+    auth_file.write_text("{not json")
+
+    with patch("llm_openai_codex.subprocess.run") as run:
+        result = CliRunner().invoke(codex, ["import", "--path", "example.com:"])
+
+    assert result.exit_code != 0
+    assert str(auth_file) in result.output
+    assert "could not be validated" in result.output
+    assert "`llm codex status`" in result.output
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize("download_result", ("scp_failure", "invalid_json"))
+def test_failed_scp_reimport_preserves_existing_expired_snapshot(
+    auth_file, download_result
+):
+    old_token = jwt({"exp": int(time.time()) - 60})
+    _write_auth(
+        auth_file,
+        {
+            "auth_mode": "chatgpt",
+            "login_type": "scp",
+            "tokens": {"access_token": old_token},
+        },
+    )
+    original = auth_file.read_bytes()
+
+    def fake_scp(args, check):
+        if download_result == "scp_failure":
+            raise subprocess.CalledProcessError(1, args)
+        Path(args[-1]).write_text("{not json")
+
+    with patch("llm_openai_codex.subprocess.run", side_effect=fake_scp):
+        result = CliRunner().invoke(codex, ["import", "--path", "example.com:"])
+
+    assert result.exit_code != 0
+    assert auth_file.read_bytes() == original
+
+
+@pytest.mark.parametrize("starts_with_snapshot", (False, True))
+def test_scp_import_preserves_auth_changed_during_transfer(
+    auth_file, starts_with_snapshot
+):
+    if starts_with_snapshot:
+        _write_auth(
+            auth_file,
+            {
+                "auth_mode": "chatgpt",
+                "login_type": "scp",
+                "tokens": {
+                    "access_token": jwt({"exp": int(time.time()) - 60})
+                },
+            },
+        )
+    concurrent_auth = {
+        "auth_mode": "chatgpt",
+        "login_type": "chatgpt",
+        "tokens": {"access_token": "concurrent", "refresh_token": "refresh"},
+    }
+
+    def fake_scp(args, check):
+        Path(args[-1]).write_text(
+            json.dumps(
+                {
+                    "auth_mode": "chatgpt",
+                    "tokens": {
+                        "access_token": jwt({"exp": int(time.time()) + 3600})
+                    },
+                }
+            )
+        )
+        _write_auth(auth_file, concurrent_auth)
+
+    with patch("llm_openai_codex.subprocess.run", side_effect=fake_scp):
+        result = CliRunner().invoke(codex, ["import", "--path", "example.com:"])
+
+    assert result.exit_code != 0
+    assert f"Plugin-owned auth at {auth_file} changed while scp was running" in result.output
+    assert "downloaded snapshot was not installed" in result.output
+    assert json.loads(auth_file.read_text()) == concurrent_auth
+
+
+def test_scp_snapshot_status_is_not_refreshable(auth_file):
+    _write_auth(
+        auth_file,
+        {
+            "auth_mode": "chatgpt",
+            "login_type": "scp",
+            "tokens": {
+                "access_token": jwt({"exp": int(time.time()) + 3600}),
+                "refresh_token": "ignored-for-scp",
+            },
+        },
+    )
+
+    result = CliRunner().invoke(codex, ["status"])
+
+    assert result.exit_code == 0
+    assert "login_type: scp" in result.output
+    assert "refreshable: no" in result.output
+
+
+def test_local_import_status_is_refreshable(auth_file):
+    _write_auth(
+        auth_file,
+        {
+            "auth_mode": "chatgpt",
+            "login_type": "import",
+            "tokens": {"access_token": "access", "refresh_token": "refresh"},
+        },
+    )
+
+    result = CliRunner().invoke(codex, ["status"])
+
+    assert result.exit_code == 0
+    assert "login_type: import" in result.output
+    assert "refreshable: yes" in result.output
+
+
+def test_unexpired_scp_snapshot_is_used_without_refresh(auth_file):
+    access_token = jwt({"exp": int(time.time()) + 10})
+    _write_auth(
+        auth_file,
+        {
+            "auth_mode": "chatgpt",
+            "login_type": "scp",
+            "tokens": {"access_token": access_token},
+        },
+    )
+
+    with patch("llm_openai_codex._refresh") as refresh:
+        token, account_id = get_codex_key()
+
+    assert (token, account_id) == (access_token, None)
+    refresh.assert_not_called()
+
+
+def test_scp_snapshot_with_unknown_expiry_is_sent_without_refresh(auth_file):
+    _write_auth(
+        auth_file,
+        {
+            "auth_mode": "chatgpt",
+            "login_type": "scp",
+            "tokens": {"access_token": "opaque-access-token"},
+        },
+    )
+
+    with patch("llm_openai_codex._refresh") as refresh:
+        assert get_codex_key() == ("opaque-access-token", None)
+
+    refresh.assert_not_called()
+
+
+def test_expired_scp_snapshot_rejects_lazy_refresh(auth_file):
+    _write_auth(
+        auth_file,
+        {
+            "auth_mode": "chatgpt",
+            "login_type": "scp",
+            "tokens": {"access_token": jwt({"exp": int(time.time()) - 60})},
+        },
+    )
+
+    with patch("llm_openai_codex._refresh") as refresh:
+        with pytest.raises(BorrowKeyError) as excinfo:
+            get_codex_key()
+
+    assert "non-refreshable access-token snapshot" in str(excinfo.value)
+    assert "has expired" in str(excinfo.value)
+    assert "llm codex import --path HOST:" in str(excinfo.value)
+    refresh.assert_not_called()
+
+
+def test_refresh_command_rejects_scp_snapshot(auth_file):
+    _write_auth(
+        auth_file,
+        {
+            "auth_mode": "chatgpt",
+            "login_type": "scp",
+            "tokens": {
+                "access_token": jwt({"exp": int(time.time()) + 3600}),
+                "refresh_token": "must-not-be-used",
+            },
+        },
+    )
+
+    with patch("llm_openai_codex._refresh") as refresh:
+        result = CliRunner().invoke(codex, ["refresh"])
+
+    assert result.exit_code != 0
+    assert "non-refreshable access-token snapshot" in result.output
+    assert "llm codex import --path HOST:" in result.output
+    refresh.assert_not_called()
 
 
 def test_refresh_command_persists_updates(auth_file):
