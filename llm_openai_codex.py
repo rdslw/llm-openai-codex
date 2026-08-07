@@ -21,6 +21,21 @@ from typing import Optional
 import click
 import llm
 from llm import AsyncModel, Model, Options, hookimpl
+
+# De facto plugin API: other plugins import from this module and the llm
+# changelog explicitly keeps its classes stable for them. Sharing the class
+# (instead of cloning it) keeps WebSearch instances interchangeable between
+# core OpenAI models and codex/ models, since llm validates server-side
+# tools with isinstance against the model's declared classes.
+from llm.default_plugins.openai_models import WebSearch
+from llm.parts import (
+    AttachmentPart,
+    ReasoningPart,
+    StreamEvent,
+    TextPart,
+    ToolCallPart,
+    ToolResultPart,
+)
 from llm.utils import simplify_usage_dict
 import openai
 from pydantic import ConfigDict, Field
@@ -998,6 +1013,13 @@ class _SharedCodexResponses:
     def __str__(self):
         return f"OpenAI Codex: {self.model_id}"
 
+    @property
+    def supported_server_side_tools(self):
+        # Bare ServerSideTool accepts raw provider specs, e.g.
+        # -T 'ServerSideTool({"type": "..."})', for Codex server tools this
+        # plugin does not know about yet.
+        return (WebSearch, llm.ServerSideTool)
+
     def _get_client_kwargs(self):
         token, account_id = get_codex_key()
         headers = {}
@@ -1021,97 +1043,148 @@ class _SharedCodexResponses:
             input=input_tokens, output=output_tokens, details=simplify_usage_dict(usage)
         )
 
-    def _build_messages(self, prompt, conversation):
-        messages = []
-        if conversation is not None:
-            for prev_response in conversation.responses:
-                if prev_response.attachments:
-                    attachment_message = []
-                    if prev_response.prompt.prompt:
-                        attachment_message.append(
-                            {"type": "input_text", "text": prev_response.prompt.prompt}
-                        )
-                    for attachment in prev_response.attachments:
-                        attachment_message.append(_attachment(attachment))
-                    messages.append({"role": "user", "content": attachment_message})
-                elif prev_response.prompt.prompt or not getattr(
-                    prev_response.prompt, "tool_results", None
-                ):
-                    messages.append(
-                        {"role": "user", "content": prev_response.prompt.prompt or ""}
-                    )
-                for tool_result in getattr(prev_response.prompt, "tool_results", []):
-                    if not tool_result.tool_call_id:
+    def _build_input(self, prompt):
+        """
+        Translate prompt.messages into (input_items, instructions).
+
+        prompt.messages is the canonical full input chain since llm 0.32 —
+        it already carries prior conversation history, so conversation must
+        not be walked separately. The most recent system message is hoisted
+        into instructions.
+        """
+        items = []
+        instructions = None
+        for message in prompt.messages:
+            if message.role == "system":
+                text = "".join(
+                    part.text for part in message.parts if isinstance(part, TextPart)
+                )
+                if text:
+                    instructions = text
+                continue
+            text_bits = []
+            attachment_items = []
+            tool_call_items = []
+            tool_result_items = []
+            reasoning_items = []
+            for part in message.parts:
+                if isinstance(part, TextPart):
+                    text_bits.append(part.text)
+                elif isinstance(part, AttachmentPart) and part.attachment:
+                    attachment_items.append(_attachment(part.attachment))
+                elif isinstance(part, ToolCallPart):
+                    # Server-side tool calls ran inside OpenAI's
+                    # infrastructure; replaying them as client
+                    # function_call items would be rejected.
+                    if part.server_executed:
                         continue
-                    messages.append(
+                    tool_call_items.append(
                         {
-                            "type": "function_call_output",
-                            "call_id": tool_result.tool_call_id,
-                            "output": tool_result.output,
+                            "type": "function_call",
+                            "call_id": part.tool_call_id,
+                            "name": part.name,
+                            "arguments": json.dumps(part.arguments),
                         }
                     )
-                prev_text = prev_response.text_or_raise()
-                if prev_text:
-                    messages.append({"role": "assistant", "content": prev_text})
-                tool_calls = prev_response.tool_calls_or_raise()
-                if tool_calls:
-                    for tool_call in tool_calls:
-                        messages.append(
-                            {
-                                "type": "function_call",
-                                "call_id": tool_call.tool_call_id,
-                                "name": tool_call.name,
-                                "arguments": json.dumps(tool_call.arguments),
-                            }
-                        )
-        if prompt.attachments:
-            attachment_message = []
-            if prompt.prompt:
-                attachment_message.append({"type": "input_text", "text": prompt.prompt})
-            for attachment in prompt.attachments:
-                attachment_message.append(_attachment(attachment))
-            messages.append({"role": "user", "content": attachment_message})
-        elif prompt.prompt or not getattr(prompt, "tool_results", None):
-            # Tool-result-only turns must not inject an empty user message
-            # between function_call and function_call_output items.
-            messages.append({"role": "user", "content": prompt.prompt or ""})
-        for tool_result in getattr(prompt, "tool_results", []):
-            if not tool_result.tool_call_id:
+                elif isinstance(part, ToolResultPart):
+                    if part.server_executed:
+                        continue
+                    tool_result_items.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": part.tool_call_id,
+                            "output": part.output,
+                        }
+                    )
+                elif isinstance(part, ReasoningPart):
+                    metadata = (part.provider_metadata or {}).get("openai") or {}
+                    encrypted = metadata.get("encrypted_content")
+                    reasoning_id = metadata.get("id")
+                    if encrypted or reasoning_id:
+                        # Round-trip the prior reasoning item so the model
+                        # can pick up its chain of thought mid-tool-loop;
+                        # we run stateless (store: False) so the API keeps
+                        # nothing server-side.
+                        item = {"type": "reasoning"}
+                        if reasoning_id:
+                            item["id"] = reasoning_id
+                        if encrypted:
+                            item["encrypted_content"] = encrypted
+                        item["summary"] = metadata.get("summary") or []
+                        reasoning_items.append(item)
+            # Reasoning items must precede the assistant message or
+            # function call they belonged to.
+            items.extend(reasoning_items)
+            if message.role == "tool":
+                items.extend(tool_result_items)
                 continue
-            messages.append(
-                {
-                    "type": "function_call_output",
-                    "call_id": tool_result.tool_call_id,
-                    "output": tool_result.output,
-                }
-            )
-        return messages
+            if message.role == "user":
+                if attachment_items:
+                    content = []
+                    if text_bits:
+                        content.append(
+                            {"type": "input_text", "text": "".join(text_bits)}
+                        )
+                    content.extend(attachment_items)
+                    items.append({"role": "user", "content": content})
+                elif text_bits:
+                    items.append({"role": "user", "content": "".join(text_bits)})
+            elif message.role == "assistant":
+                if text_bits:
+                    items.append(
+                        {"role": "assistant", "content": "".join(text_bits)}
+                    )
+                items.extend(tool_call_items)
+        return items, instructions
 
-    def _build_kwargs(self, prompt, conversation):
-        messages = self._build_messages(prompt, conversation)
+    def _build_kwargs(self, prompt):
+        input_items, instructions = self._build_input(prompt)
         kwargs = {
             "model": self.model_name,
-            "input": messages,
+            "input": input_items,
             "store": False,
             "stream": True,
-            "instructions": prompt.system or "You are a helpful assistant.",
+            "instructions": (
+                instructions or prompt.system or "You are a helpful assistant."
+            ),
+            # Stateless mode: ask for encrypted reasoning items so they can
+            # be round-tripped on the next turn via provider_metadata.
+            "include": ["reasoning.encrypted_content"],
         }
         for option in ("max_output_tokens", "temperature", "top_p"):
             value = getattr(prompt.options, option, None)
             if value is not None:
                 kwargs[option] = value
 
+        reasoning = {}
+        if not getattr(prompt, "hide_reasoning", False):
+            # Codex models are all reasoning models; request visible
+            # summaries unless the caller passed hide_reasoning / -R.
+            reasoning["summary"] = "auto"
         reasoning_effort = getattr(prompt.options, "reasoning_effort", None)
         if reasoning_effort is not None:
-            kwargs["reasoning"] = {"effort": reasoning_effort}
+            reasoning["effort"] = reasoning_effort
+        if reasoning:
+            kwargs["reasoning"] = reasoning
 
         text = {}
         verbosity = getattr(prompt.options, "verbosity", None)
         if verbosity is not None:
             text["verbosity"] = verbosity
 
+        server_side_tools = [
+            tool
+            for tool in (prompt.tools or [])
+            if isinstance(tool, llm.ServerSideTool)
+        ]
+        server_side_specs = [tool.tool_spec(self) for tool in server_side_tools]
         tool_defs = []
-        if getattr(prompt.options, "web_search", None):
+        if getattr(prompt.options, "web_search", None) and not any(
+            spec.get("type") == "web_search" for spec in server_side_specs
+        ):
+            # Option-based web_search predates server-side tool support and
+            # is kept for backwards compatibility and per-model defaults;
+            # an explicit WebSearch tool instance wins over it.
             web_search_tool = {"type": "web_search"}
             live = getattr(prompt.options, "web_search_live", None)
             if live is not None:
@@ -1120,8 +1193,11 @@ class _SharedCodexResponses:
             if context_size is not None:
                 web_search_tool["search_context_size"] = context_size
             tool_defs.append(web_search_tool)
+        tool_defs.extend(server_side_specs)
         if prompt.tools:
             for tool in prompt.tools:
+                if isinstance(tool, llm.ServerSideTool):
+                    continue
                 if not getattr(tool, "name", None):
                     continue
                 parameters = tool.input_schema or {
@@ -1152,12 +1228,49 @@ class _SharedCodexResponses:
         for key, value in extras.items():
             if value is not None and key not in kwargs:
                 kwargs[key] = value
+        # Server-side tool hooks run last, on the complete baseline request,
+        # in list order (e.g. WebSearch appends its include entries).
+        for tool in server_side_tools:
+            tool.prepare_request(self, kwargs)
         return kwargs
 
-    def _handle_event(self, event, response):
+    def _new_stream_state(self):
+        return {
+            # Reasoning item ids whose text already streamed as deltas, so
+            # the .done / output_item.done fallbacks do not repeat it.
+            "reasoning_streamed": set(),
+            # Reasoning item id -> the StreamEvent yielded at
+            # output_item.done, so the refresh after response.completed can
+            # target the part that event resolved to.
+            "reasoning_done": {},
+        }
+
+    def _handle_event(self, event, response, state):
+        """Translate one Responses API stream event into StreamEvents."""
         et = getattr(event, "type", None)
         if et == "response.output_text.delta":
-            return event.delta
+            return [StreamEvent(type="text", chunk=event.delta or "")]
+
+        if et in (
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_text.delta",
+        ):
+            item_id = getattr(event, "item_id", None)
+            if item_id:
+                state["reasoning_streamed"].add(item_id)
+            return [StreamEvent(type="reasoning", chunk=event.delta or "")]
+
+        if et in (
+            "response.reasoning_summary_text.done",
+            "response.reasoning_text.done",
+        ):
+            item_id = getattr(event, "item_id", None)
+            text = getattr(event, "text", None) or ""
+            if text and item_id not in state["reasoning_streamed"]:
+                if item_id:
+                    state["reasoning_streamed"].add(item_id)
+                return [StreamEvent(type="reasoning", chunk=text)]
+            return []
 
         if et == "response.output_item.done":
             item = event.item
@@ -1167,21 +1280,7 @@ class _SharedCodexResponses:
                 data = item
             else:
                 data = getattr(item, "__dict__", {}) or {}
-            if data.get("type") == "function_call":
-                tool_id = data.get("call_id") or data.get("id") or "unknown"
-                name = data.get("name") or "unknown_tool"
-                arguments = data.get("arguments") or "{}"
-                try:
-                    parsed = json.loads(arguments)
-                except Exception:
-                    parsed = arguments
-                response.add_tool_call(
-                    llm.ToolCall(
-                        tool_call_id=tool_id,
-                        name=name,
-                        arguments=parsed,
-                    )
-                )
+            return self._output_item_done_events(data, response, state)
 
         if et in ("response.completed", "response.incomplete", "response.failed"):
             response.response_json = event.response.model_dump()
@@ -1190,32 +1289,168 @@ class _SharedCodexResponses:
                 error = getattr(event.response, "error", None)
                 message = getattr(error, "message", None) or "Codex response failed."
                 raise llm.ModelError(message)
-            return None
+            if et == "response.completed":
+                return self._reasoning_refresh_events(
+                    response.response_json, state["reasoning_done"]
+                )
+            return []
 
         if et == "error":
             raise llm.ModelError(
                 getattr(event, "message", None) or "Codex stream returned an error."
             )
+        return []
+
+    def _output_item_done_events(self, data, response, state):
+        item_type = data.get("type")
+        if item_type == "function_call":
+            # A missing call id gets a synthesized unique tc_ id from llm.
+            tool_id = data.get("call_id") or data.get("id") or None
+            name = data.get("name") or "unknown_tool"
+            arguments = data.get("arguments") or "{}"
+            try:
+                parsed = json.loads(arguments)
+            except Exception:
+                parsed = arguments
+            response.add_tool_call(
+                llm.ToolCall(
+                    tool_call_id=tool_id,
+                    name=name,
+                    arguments=parsed,
+                )
+            )
+            return [
+                StreamEvent(type="tool_call_name", chunk=name, tool_call_id=tool_id),
+                StreamEvent(
+                    type="tool_call_args", chunk=arguments, tool_call_id=tool_id
+                ),
+            ]
+        if item_type == "reasoning":
+            item_id = data.get("id")
+            reasoning_event = self._reasoning_event(
+                data,
+                include_text=item_id not in state["reasoning_streamed"],
+            )
+            if item_id:
+                state["reasoning_done"][item_id] = reasoning_event
+            return [reasoning_event]
+        if item_type == "web_search_call":
+            return self._web_search_events(data)
+        return []
+
+    def _reasoning_event(self, data, include_text=True):
+        """
+        StreamEvent carrying a reasoning item's opaque id, encrypted_content
+        and summary, echoed back on the next request by _build_input so the
+        model can resume its prior chain of thought across tool calls.
+        """
+        metadata = {
+            key: data[key]
+            for key in ("id", "encrypted_content", "summary")
+            if data.get(key)
+        }
+        text = ""
+        if include_text:
+            for field_name in ("summary", "content"):
+                for part in data.get(field_name) or []:
+                    part_text = (
+                        part.get("text") if isinstance(part, dict) else None
+                    )
+                    if part_text:
+                        text += part_text
+        return StreamEvent(
+            type="reasoning",
+            chunk=text,
+            redacted=include_text and not text,
+            provider_metadata={"openai": metadata} if metadata else None,
+        )
+
+    def _reasoning_refresh_events(self, response_json, reasoning_done):
+        """
+        Metadata-only reasoning events rebuilt from the final payload.
+
+        response.completed carries a different ciphertext of the same
+        reasoning than output_item.done (OpenAI encrypts per event).
+        Re-emitting the metadata from the final payload, aimed at the
+        already-resolved part_index, makes the stored part and
+        response_json agree on one blob.
+        """
+        events = []
+        for item in (response_json or {}).get("output") or []:
+            if not isinstance(item, dict) or item.get("type") != "reasoning":
+                continue
+            prior = reasoning_done.get(item.get("id"))
+            if prior is None or prior.part_index is None:
+                continue
+            metadata = {
+                key: item[key]
+                for key in ("id", "encrypted_content", "summary")
+                if item.get(key)
+            }
+            if metadata:
+                events.append(
+                    StreamEvent(
+                        type="reasoning",
+                        chunk="",
+                        part_index=prior.part_index,
+                        message_index=prior.message_index,
+                        provider_metadata={"openai": metadata},
+                    )
+                )
+        return events
+
+    def _web_search_events(self, data):
+        """
+        server_executed events for a web_search_call output item so the
+        search is recorded in the message parts without entering the
+        locally-executable tool call list.
+        """
+        tool_id = data.get("id")
+        results = data.get("results") or []
+        return [
+            StreamEvent(
+                type="tool_call_name",
+                chunk="web_search",
+                tool_call_id=tool_id,
+                server_executed=True,
+            ),
+            StreamEvent(
+                type="tool_call_args",
+                chunk=json.dumps(data.get("action") or {}),
+                tool_call_id=tool_id,
+                server_executed=True,
+            ),
+            StreamEvent(
+                type="tool_result",
+                chunk=(
+                    json.dumps(results)
+                    if results
+                    else (data.get("status") or "completed")
+                ),
+                tool_call_id=tool_id,
+                server_executed=True,
+                tool_name="web_search",
+            ),
+        ]
 
 
 class CodexResponsesModel(_SharedCodexResponses, Model):
     def execute(self, prompt, stream, response, conversation):
         client = openai.OpenAI(**self._get_client_kwargs())
-        kwargs = self._build_kwargs(prompt, conversation)
+        kwargs = self._build_kwargs(prompt)
+        state = self._new_stream_state()
         for event in client.responses.create(**kwargs):
-            delta = self._handle_event(event, response)
-            if delta is not None:
-                yield delta
+            yield from self._handle_event(event, response, state)
 
 
 class AsyncCodexResponsesModel(_SharedCodexResponses, AsyncModel):
     async def execute(self, prompt, stream, response, conversation):
         client = openai.AsyncOpenAI(**self._get_client_kwargs())
-        kwargs = self._build_kwargs(prompt, conversation)
+        kwargs = self._build_kwargs(prompt)
+        state = self._new_stream_state()
         async for event in await client.responses.create(**kwargs):
-            delta = self._handle_event(event, response)
-            if delta is not None:
-                yield delta
+            for stream_event in self._handle_event(event, response, state):
+                yield stream_event
 
 
 def _attachment(attachment):

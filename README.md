@@ -14,7 +14,10 @@ LLM plugin for accessing ChatGPT/Codex-backed OpenAI models through the Response
 - Missing `account_id` values are derived from OAuth JWT claims when possible.
 - Added `llm codex usage` showing current Codex plan usage.
 - Registers known hidden/fallback Codex models such as `gpt-5.3-codex-spark`.
-- Added OpenAI's server-side `web_search` tool via `-o web_search 1`.
+- Added OpenAI's server-side `web_search` tool via `-T WebSearch` (shared
+  with LLM's built-in OpenAI models) or `-o web_search 1`.
+- Streams visible reasoning summaries and round-trips encrypted reasoning
+  between turns (requires LLM 0.32 or later).
 
 ## Installation
 
@@ -92,21 +95,50 @@ llm -m codex/gpt-5.6-terra -o verbosity low "Summarize this"
 
 Image attachments (`-a image.png`) are sent at low detail to limit token use.
 
+## Reasoning
+
+Codex models are reasoning models. Visible reasoning summaries stream to
+standard error while a response runs; hide them with `-R`/`--hide-reasoning`.
+Requests run stateless (`store: false`), so the plugin asks the API for
+encrypted reasoning items and echoes them back on later turns. The model keeps
+its chain of thought across tool calls and continued conversations
+(`llm -c`, `llm chat -c`).
+
 ## Web search
 
-Enable OpenAI's server-side search (it runs on OpenAI's servers, not locally):
+OpenAI's server-side search (it runs on OpenAI's servers, not locally) is
+available as a server-side tool using the same `WebSearch` class as LLM's
+built-in OpenAI models:
 
 ```bash
-llm -m codex/gpt-5.6-luna -o web_search 1 "What happened in AI news today?"
-llm -m codex/gpt-5.6-luna -o web_search 1 -o web_search_live 1 "Latest stable Python release?"
-llm -m codex/gpt-5.6-luna -o web_search 1 -o web_search_context_size high "Recent LLM benchmarks"
+llm -m codex/gpt-5.6-luna -T WebSearch "What happened in AI news today?"
+llm -m codex/gpt-5.6-luna -T 'WebSearch(external_web_access=True)' "Latest stable Python release?"
+llm -m codex/gpt-5.6-luna -T 'WebSearch(allowed_domains=["python.org"], search_context_size="high")' "Recent Python changes"
 ```
 
-`web_search_live` requests live internet access instead of the cached index. Context size is `low`, `medium`, or `high`. Availability depends on the plan and model. Set a per-model default with:
+`external_web_access` requests live internet access instead of the cached
+index. Run `llm tools -m codex/gpt-5.6-luna` to see every constructor
+argument, including domain filters, user location, and image search.
+Conversations continued with `llm -c` restore the configured tool
+automatically. Raw provider specifications also work, for server-side tools
+the plugin does not know about yet:
 
 ```bash
+llm -m codex/gpt-5.6-luna -T 'ServerSideTool({"type": "web_search"})' "..."
+```
+
+The older option-based form is still supported and remains the way to set a
+per-model default:
+
+```bash
+llm -m codex/gpt-5.6-luna -o web_search 1 -o web_search_live 1 "Latest stable Python release?"
 llm models options set codex/gpt-5.6-luna web_search 1
 ```
+
+`web_search_live` maps to `external_web_access` and
+`web_search_context_size` to `search_context_size`. An explicit `-T
+WebSearch` tool takes precedence over the option-based form. Availability
+depends on the plan and model.
 
 ## Development
 

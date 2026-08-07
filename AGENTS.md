@@ -19,6 +19,12 @@
 ## Model invariants
 
 - Public LLM model IDs use the `codex/` prefix.
+- Request input is built from `prompt.messages`, the canonical full chain
+  since llm 0.32. Never walk `conversation.responses`; reloaded conversations
+  no longer populate it.
+- Reasoning metadata (`id`, `encrypted_content`, `summary`) round-trips via
+  `provider_metadata["openai"]` on `ReasoningPart` objects; requests stay
+  stateless with `store: false`.
 - Entries in `DEFAULT_MODELS` are raw API slugs without `codex/`; registration
   adds the prefix.
 - Registration combines models discovered from the Codex API with hardcoded

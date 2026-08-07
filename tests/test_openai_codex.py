@@ -9,6 +9,15 @@ from unittest.mock import patch
 
 from click.testing import CliRunner
 import llm
+from llm.default_plugins.openai_models import WebSearch
+from llm.parts import (
+    AttachmentPart,
+    Message,
+    ReasoningPart,
+    TextPart,
+    ToolCallPart,
+    ToolResultPart,
+)
 import pytest
 
 from llm_openai_codex import (
@@ -90,26 +99,37 @@ def test_model_metadata():
 def test_build_kwargs_basic():
     model = CodexResponsesModel("gpt-5.4")
     prompt = llm.Prompt(model=model, prompt="Hello")
-    kwargs = model._build_kwargs(prompt, None)
+    kwargs = model._build_kwargs(prompt)
     assert kwargs["model"] == "gpt-5.4"
     assert kwargs["store"] is False
     assert kwargs["stream"] is True
     assert kwargs["instructions"] == "You are a helpful assistant."
     assert kwargs["input"] == [{"role": "user", "content": "Hello"}]
+    assert kwargs["include"] == ["reasoning.encrypted_content"]
+    assert kwargs["reasoning"] == {"summary": "auto"}
 
 
 def test_build_kwargs_with_system():
     model = CodexResponsesModel("gpt-5.4")
     prompt = llm.Prompt(model=model, prompt="Hello", system="Be brief.")
-    kwargs = model._build_kwargs(prompt, None)
+    kwargs = model._build_kwargs(prompt)
     assert kwargs["instructions"] == "Be brief."
+    # The system message is hoisted into instructions, not sent as input.
+    assert kwargs["input"] == [{"role": "user", "content": "Hello"}]
+
+
+def test_build_kwargs_hide_reasoning_skips_summary():
+    model = CodexResponsesModel("gpt-5.4")
+    prompt = llm.Prompt(model=model, prompt="Hello", hide_reasoning=True)
+    kwargs = model._build_kwargs(prompt)
+    assert "reasoning" not in kwargs
 
 
 def test_build_kwargs_with_options():
     model = CodexResponsesModel("gpt-5.4")
     prompt = llm.Prompt(model=model, prompt="Hello")
     prompt.options = model.Options(temperature=0.5, max_output_tokens=100, top_p=0.9)
-    kwargs = model._build_kwargs(prompt, None)
+    kwargs = model._build_kwargs(prompt)
     assert kwargs["temperature"] == 0.5
     assert kwargs["max_output_tokens"] == 100
     assert kwargs["top_p"] == 0.9
@@ -119,7 +139,15 @@ def test_build_kwargs_reasoning_effort():
     model = CodexResponsesModel("gpt-5.4")
     prompt = llm.Prompt(model=model, prompt="Hello")
     prompt.options = model.Options(reasoning_effort="high")
-    kwargs = model._build_kwargs(prompt, None)
+    kwargs = model._build_kwargs(prompt)
+    assert kwargs["reasoning"] == {"summary": "auto", "effort": "high"}
+
+
+def test_build_kwargs_reasoning_effort_survives_hide_reasoning():
+    model = CodexResponsesModel("gpt-5.4")
+    prompt = llm.Prompt(model=model, prompt="Hello", hide_reasoning=True)
+    prompt.options = model.Options(reasoning_effort="high")
+    kwargs = model._build_kwargs(prompt)
     assert kwargs["reasoning"] == {"effort": "high"}
 
 
@@ -127,7 +155,7 @@ def test_build_kwargs_verbosity():
     model = CodexResponsesModel("gpt-5.4")
     prompt = llm.Prompt(model=model, prompt="Hello")
     prompt.options = model.Options(verbosity="low")
-    kwargs = model._build_kwargs(prompt, None)
+    kwargs = model._build_kwargs(prompt)
     assert kwargs["text"]["verbosity"] == "low"
 
 
@@ -136,7 +164,7 @@ def test_build_kwargs_verbosity_and_schema():
     prompt = llm.Prompt(model=model, prompt="Hello")
     prompt.options = model.Options(verbosity="high")
     prompt.schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
-    kwargs = model._build_kwargs(prompt, None)
+    kwargs = model._build_kwargs(prompt)
     assert kwargs["text"]["verbosity"] == "high"
     assert kwargs["text"]["format"]["schema"] == prompt.schema
 
@@ -145,7 +173,7 @@ def test_build_kwargs_forwards_extra_options():
     model = CodexResponsesModel("gpt-5.4")
     prompt = llm.Prompt(model=model, prompt="Hello")
     prompt.options = model.Options(service_tier="flex")
-    kwargs = model._build_kwargs(prompt, None)
+    kwargs = model._build_kwargs(prompt)
     assert kwargs["service_tier"] == "flex"
 
 
@@ -155,7 +183,7 @@ def test_build_kwargs_web_search():
     prompt.options = model.Options(
         web_search=True, web_search_live=True, web_search_context_size="high"
     )
-    kwargs = model._build_kwargs(prompt, None)
+    kwargs = model._build_kwargs(prompt)
     assert kwargs["tools"] == [
         {
             "type": "web_search",
@@ -169,14 +197,14 @@ def test_build_kwargs_web_search_minimal():
     model = CodexResponsesModel("gpt-5.4")
     prompt = llm.Prompt(model=model, prompt="Hello")
     prompt.options = model.Options(web_search=True)
-    kwargs = model._build_kwargs(prompt, None)
+    kwargs = model._build_kwargs(prompt)
     assert kwargs["tools"] == [{"type": "web_search"}]
 
 
 def test_build_kwargs_no_web_search_by_default():
     model = CodexResponsesModel("gpt-5.4")
     prompt = llm.Prompt(model=model, prompt="Hello")
-    kwargs = model._build_kwargs(prompt, None)
+    kwargs = model._build_kwargs(prompt)
     assert "tools" not in kwargs
 
 
@@ -185,70 +213,119 @@ def test_build_kwargs_web_search_coexists_with_function_tool():
     prompt = llm.Prompt(model=model, prompt="Hello")
     prompt.options = model.Options(web_search=True)
     prompt.tools = [llm.Tool(name="my_tool", description="d")]
-    kwargs = model._build_kwargs(prompt, None)
+    kwargs = model._build_kwargs(prompt)
     assert kwargs["tools"][0] == {"type": "web_search"}
     assert kwargs["tools"][1]["type"] == "function"
     assert kwargs["tools"][1]["name"] == "my_tool"
 
 
-class FakePrevResponse:
-    """Stand-in for a logged llm Response in conversation history."""
-
-    def __init__(
-        self, prompt_text, text="", tool_calls=None, tool_results=None, attachments=None
-    ):
-        self.prompt = SimpleNamespace(
-            prompt=prompt_text, tool_results=tool_results or []
-        )
-        self.attachments = attachments or []
-        self._text = text
-        self._tool_calls = tool_calls or []
-
-    def text_or_raise(self):
-        return self._text
-
-    def tool_calls_or_raise(self):
-        return self._tool_calls
-
-
-def test_build_messages_skips_empty_user_turn_with_tool_results():
+def test_supported_server_side_tools_declared():
     model = CodexResponsesModel("gpt-5.4")
-    prompt = llm.Prompt(model=model, prompt="")
-    prompt.tool_results = [
-        llm.ToolResult(name="get_time", output="noon", tool_call_id="call_1")
+    assert model.supported_server_side_tools == (WebSearch, llm.ServerSideTool)
+
+
+def test_build_kwargs_web_search_server_side_tool():
+    model = CodexResponsesModel("gpt-5.4")
+    prompt = llm.Prompt(model=model, prompt="Hello")
+    prompt.tools = [
+        WebSearch(
+            allowed_domains=["python.org"],
+            external_web_access=True,
+            include_results=True,
+        )
     ]
-    messages = model._build_messages(prompt, None)
-    assert messages == [
+    kwargs = model._build_kwargs(prompt)
+    assert kwargs["tools"] == [
+        {
+            "type": "web_search",
+            "filters": {"allowed_domains": ["python.org"]},
+            "external_web_access": True,
+        }
+    ]
+    # prepare_request ran on the complete baseline request.
+    assert kwargs["include"] == [
+        "reasoning.encrypted_content",
+        "web_search_call.results",
+    ]
+
+
+def test_build_kwargs_raw_server_side_tool_spec():
+    model = CodexResponsesModel("gpt-5.4")
+    prompt = llm.Prompt(model=model, prompt="Hello")
+    prompt.tools = [llm.ServerSideTool({"type": "custom_search"})]
+    kwargs = model._build_kwargs(prompt)
+    assert kwargs["tools"] == [{"type": "custom_search"}]
+
+
+def test_web_search_option_defers_to_web_search_tool_instance():
+    model = CodexResponsesModel("gpt-5.4")
+    prompt = llm.Prompt(model=model, prompt="Hello")
+    prompt.options = model.Options(web_search=True, web_search_live=True)
+    prompt.tools = [WebSearch(search_context_size="high")]
+    kwargs = model._build_kwargs(prompt)
+    assert kwargs["tools"] == [
+        {"type": "web_search", "search_context_size": "high"}
+    ]
+
+
+def test_server_side_tool_coexists_with_function_tool():
+    model = CodexResponsesModel("gpt-5.4")
+    prompt = llm.Prompt(model=model, prompt="Hello")
+    prompt.tools = [WebSearch(), llm.Tool(name="my_tool", description="d")]
+    kwargs = model._build_kwargs(prompt)
+    assert kwargs["tools"][0] == {"type": "web_search"}
+    assert kwargs["tools"][1]["type"] == "function"
+    assert kwargs["tools"][1]["name"] == "my_tool"
+
+
+def test_build_input_tool_result_only_turn_has_no_empty_user_message():
+    model = CodexResponsesModel("gpt-5.4")
+    prompt = llm.Prompt(
+        "",
+        model,
+        tool_results=[
+            llm.ToolResult(name="get_time", output="noon", tool_call_id="call_1")
+        ],
+    )
+    items, instructions = model._build_input(prompt)
+    assert instructions is None
+    assert items == [
         {"type": "function_call_output", "call_id": "call_1", "output": "noon"}
     ]
 
 
-def test_build_messages_replays_tool_loop_history_without_empty_user_turns():
+def test_build_input_hoists_system_message_into_instructions():
     model = CodexResponsesModel("gpt-5.4")
-    conversation = SimpleNamespace(
-        responses=[
-            FakePrevResponse(
-                "What time?",
-                tool_calls=[
-                    llm.ToolCall(
-                        tool_call_id="call_1", name="get_time", arguments={}
-                    )
-                ],
-            ),
-            FakePrevResponse(
-                None,
-                text="It is noon.",
-                tool_results=[
-                    llm.ToolResult(
-                        name="get_time", output="noon", tool_call_id="call_1"
-                    )
-                ],
-            ),
-        ]
+    prompt = llm.Prompt(
+        None, model, messages=[llm.system("Be brief."), llm.user("Hello")]
     )
-    prompt = llm.Prompt(model=model, prompt="Thanks!")
-    messages = model._build_messages(prompt, conversation)
-    assert messages == [
+    items, instructions = model._build_input(prompt)
+    assert instructions == "Be brief."
+    assert items == [{"role": "user", "content": "Hello"}]
+
+
+def test_build_input_replays_tool_loop_history_without_empty_user_turns():
+    model = CodexResponsesModel("gpt-5.4")
+    messages = [
+        llm.user("What time?"),
+        Message(
+            role="assistant",
+            parts=[
+                ToolCallPart(name="get_time", arguments={}, tool_call_id="call_1")
+            ],
+        ),
+        Message(
+            role="tool",
+            parts=[
+                ToolResultPart(name="get_time", output="noon", tool_call_id="call_1")
+            ],
+        ),
+        llm.assistant("It is noon."),
+        llm.user("Thanks!"),
+    ]
+    prompt = llm.Prompt(None, model, messages=messages)
+    items, _ = model._build_input(prompt)
+    assert items == [
         {"role": "user", "content": "What time?"},
         {
             "type": "function_call",
@@ -262,33 +339,16 @@ def test_build_messages_replays_tool_loop_history_without_empty_user_turns():
     ]
 
 
-class RecordingResponse:
-    """Stand-in for llm's Response in _handle_event tests."""
-
-    def __init__(self):
-        self.response_json = None
-        self.usage = None
-        self.tool_calls = []
-
-    def set_usage(self, input=None, output=None, details=None):
-        self.usage = (input, output, details)
-
-    def add_tool_call(self, tool_call):
-        self.tool_calls.append(tool_call)
-
-
-def test_build_messages_with_attachments_in_history_and_prompt():
+def test_build_input_with_attachments_in_history_and_prompt():
     model = CodexResponsesModel("gpt-5.4")
-    image = SimpleNamespace(url="https://example.com/old.png")
-    conversation = SimpleNamespace(
-        responses=[
-            FakePrevResponse("Look at this", text="Nice.", attachments=[image])
-        ]
-    )
-    prompt = llm.Prompt(model=model, prompt="And this?")
-    prompt.attachments = [SimpleNamespace(url="https://example.com/new.png")]
-    messages = model._build_messages(prompt, conversation)
-    assert messages == [
+    messages = [
+        llm.user("Look at this", llm.Attachment(url="https://example.com/old.png")),
+        llm.assistant("Nice."),
+        llm.user("And this?", llm.Attachment(url="https://example.com/new.png")),
+    ]
+    prompt = llm.Prompt(None, model, messages=messages)
+    items, _ = model._build_input(prompt)
+    assert items == [
         {
             "role": "user",
             "content": [
@@ -315,13 +375,205 @@ def test_build_messages_with_attachments_in_history_and_prompt():
     ]
 
 
-def test_handle_event_output_text_delta_returns_delta():
+def test_build_input_round_trips_reasoning_metadata():
+    model = CodexResponsesModel("gpt-5.4")
+    summary = [{"type": "summary_text", "text": "Thinking"}]
+    messages = [
+        llm.user("What time?"),
+        Message(
+            role="assistant",
+            parts=[
+                ReasoningPart(
+                    text="Thinking",
+                    provider_metadata={
+                        "openai": {
+                            "id": "rs_1",
+                            "encrypted_content": "blob",
+                            "summary": summary,
+                        }
+                    },
+                ),
+                ToolCallPart(name="get_time", arguments={}, tool_call_id="call_1"),
+            ],
+        ),
+        Message(
+            role="tool",
+            parts=[
+                ToolResultPart(name="get_time", output="noon", tool_call_id="call_1")
+            ],
+        ),
+    ]
+    prompt = llm.Prompt(None, model, messages=messages)
+    items, _ = model._build_input(prompt)
+    assert items == [
+        {"role": "user", "content": "What time?"},
+        {
+            "type": "reasoning",
+            "id": "rs_1",
+            "encrypted_content": "blob",
+            "summary": summary,
+        },
+        {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "get_time",
+            "arguments": "{}",
+        },
+        {"type": "function_call_output", "call_id": "call_1", "output": "noon"},
+    ]
+
+
+def test_build_input_skips_reasoning_without_openai_metadata():
+    model = CodexResponsesModel("gpt-5.4")
+    messages = [
+        llm.user("Hi"),
+        Message(
+            role="assistant",
+            parts=[ReasoningPart(text="old transcript"), TextPart(text="Hello.")],
+        ),
+        llm.user("Again?"),
+    ]
+    prompt = llm.Prompt(None, model, messages=messages)
+    items, _ = model._build_input(prompt)
+    assert items == [
+        {"role": "user", "content": "Hi"},
+        {"role": "assistant", "content": "Hello."},
+        {"role": "user", "content": "Again?"},
+    ]
+
+
+def test_build_input_skips_server_executed_tool_parts():
+    model = CodexResponsesModel("gpt-5.4")
+    messages = [
+        llm.user("Search the news"),
+        Message(
+            role="assistant",
+            parts=[
+                ToolCallPart(
+                    name="web_search",
+                    arguments={"query": "news"},
+                    tool_call_id="ws_1",
+                    server_executed=True,
+                ),
+                TextPart(text="Found it."),
+            ],
+        ),
+        Message(
+            role="tool",
+            parts=[
+                ToolResultPart(
+                    name="web_search",
+                    output="hits",
+                    tool_call_id="ws_1",
+                    server_executed=True,
+                )
+            ],
+        ),
+    ]
+    prompt = llm.Prompt(None, model, messages=messages)
+    items, _ = model._build_input(prompt)
+    assert items == [
+        {"role": "user", "content": "Search the news"},
+        {"role": "assistant", "content": "Found it."},
+    ]
+
+
+class RecordingResponse:
+    """Stand-in for llm's Response in _handle_event tests."""
+
+    def __init__(self):
+        self.response_json = None
+        self.usage = None
+        self.tool_calls = []
+
+    def set_usage(self, input=None, output=None, details=None):
+        self.usage = (input, output, details)
+
+    def add_tool_call(self, tool_call):
+        self.tool_calls.append(tool_call)
+
+
+def test_handle_event_output_text_delta_yields_text_event():
     model = CodexResponsesModel("gpt-5.4")
     event = SimpleNamespace(type="response.output_text.delta", delta="Hel")
-    assert model._handle_event(event, RecordingResponse()) == "Hel"
+    events = model._handle_event(
+        event, RecordingResponse(), model._new_stream_state()
+    )
+    assert [(e.type, e.chunk) for e in events] == [("text", "Hel")]
 
 
-def test_handle_event_function_call_adds_tool_call():
+def test_handle_event_reasoning_delta_yields_reasoning_event():
+    model = CodexResponsesModel("gpt-5.4")
+    state = model._new_stream_state()
+    delta = SimpleNamespace(
+        type="response.reasoning_summary_text.delta", delta="Th", item_id="rs_1"
+    )
+    events = model._handle_event(delta, RecordingResponse(), state)
+    assert [(e.type, e.chunk) for e in events] == [("reasoning", "Th")]
+    # The .done event must not repeat text that already streamed as deltas.
+    done = SimpleNamespace(
+        type="response.reasoning_summary_text.done", text="Thinking", item_id="rs_1"
+    )
+    assert model._handle_event(done, RecordingResponse(), state) == []
+
+
+def test_handle_event_reasoning_done_is_fallback_without_deltas():
+    model = CodexResponsesModel("gpt-5.4")
+    done = SimpleNamespace(
+        type="response.reasoning_text.done", text="Thinking", item_id="rs_1"
+    )
+    events = model._handle_event(
+        done, RecordingResponse(), model._new_stream_state()
+    )
+    assert [(e.type, e.chunk) for e in events] == [("reasoning", "Thinking")]
+
+
+def test_handle_event_reasoning_item_harvests_encrypted_content():
+    model = CodexResponsesModel("gpt-5.4")
+    state = model._new_stream_state()
+    summary = [{"type": "summary_text", "text": "Thinking"}]
+    event = SimpleNamespace(
+        type="response.output_item.done",
+        item={
+            "type": "reasoning",
+            "id": "rs_1",
+            "encrypted_content": "blob",
+            "summary": summary,
+        },
+    )
+    events = model._handle_event(event, RecordingResponse(), state)
+    assert len(events) == 1
+    assert events[0].type == "reasoning"
+    # No deltas were streamed, so the summary text rides on this event.
+    assert events[0].chunk == "Thinking"
+    assert events[0].provider_metadata == {
+        "openai": {"id": "rs_1", "encrypted_content": "blob", "summary": summary}
+    }
+    assert state["reasoning_done"]["rs_1"] is events[0]
+
+
+def test_handle_event_reasoning_item_after_deltas_is_metadata_only():
+    model = CodexResponsesModel("gpt-5.4")
+    state = model._new_stream_state()
+    delta = SimpleNamespace(
+        type="response.reasoning_summary_text.delta", delta="Th", item_id="rs_1"
+    )
+    model._handle_event(delta, RecordingResponse(), state)
+    event = SimpleNamespace(
+        type="response.output_item.done",
+        item={
+            "type": "reasoning",
+            "id": "rs_1",
+            "encrypted_content": "blob",
+            "summary": [{"type": "summary_text", "text": "Th"}],
+        },
+    )
+    events = model._handle_event(event, RecordingResponse(), state)
+    assert events[0].chunk == ""
+    assert events[0].provider_metadata["openai"]["encrypted_content"] == "blob"
+
+
+def test_handle_event_function_call_adds_tool_call_and_yields_events():
     model = CodexResponsesModel("gpt-5.4")
     event = SimpleNamespace(
         type="response.output_item.done",
@@ -333,11 +585,49 @@ def test_handle_event_function_call_adds_tool_call():
         },
     )
     response = RecordingResponse()
-    assert model._handle_event(event, response) is None
+    events = model._handle_event(event, response, model._new_stream_state())
     assert len(response.tool_calls) == 1
     assert response.tool_calls[0].tool_call_id == "call_1"
     assert response.tool_calls[0].name == "get_time"
     assert response.tool_calls[0].arguments == {"tz": "UTC"}
+    assert [(e.type, e.chunk, e.tool_call_id) for e in events] == [
+        ("tool_call_name", "get_time", "call_1"),
+        ("tool_call_args", '{"tz": "UTC"}', "call_1"),
+    ]
+
+
+def test_handle_event_function_call_without_id_lets_llm_synthesize_one():
+    model = CodexResponsesModel("gpt-5.4")
+    event = SimpleNamespace(
+        type="response.output_item.done",
+        item={"type": "function_call", "name": "get_time", "arguments": "{}"},
+    )
+    response = RecordingResponse()
+    model._handle_event(event, response, model._new_stream_state())
+    assert response.tool_calls[0].tool_call_id is None
+
+
+def test_handle_event_web_search_call_yields_server_executed_events():
+    model = CodexResponsesModel("gpt-5.4")
+    event = SimpleNamespace(
+        type="response.output_item.done",
+        item={
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": {"query": "news"},
+        },
+    )
+    response = RecordingResponse()
+    events = model._handle_event(event, response, model._new_stream_state())
+    assert response.tool_calls == []
+    assert all(e.server_executed for e in events)
+    assert [(e.type, e.chunk) for e in events] == [
+        ("tool_call_name", "web_search"),
+        ("tool_call_args", '{"query": "news"}'),
+        ("tool_result", "completed"),
+    ]
+    assert events[2].tool_name == "web_search"
 
 
 def test_handle_event_completed_sets_response_json_and_usage():
@@ -350,9 +640,99 @@ def test_handle_event_completed_sets_response_json_and_usage():
         ),
     )
     response = RecordingResponse()
-    assert model._handle_event(event, response) is None
+    assert model._handle_event(event, response, model._new_stream_state()) == []
     assert response.response_json == {"status": "completed"}
     assert response.usage == (7, 3, {})
+
+
+def test_handle_event_completed_reemits_reasoning_metadata_from_final_payload():
+    model = CodexResponsesModel("gpt-5.4")
+    state = model._new_stream_state()
+    done = SimpleNamespace(
+        type="response.output_item.done",
+        item={"type": "reasoning", "id": "rs_1", "encrypted_content": "blob-a"},
+    )
+    response = RecordingResponse()
+    [prior] = model._handle_event(done, response, state)
+    # The framework resolves part_index on yielded events by stream end.
+    prior.part_index = 2
+    completed = SimpleNamespace(
+        type="response.completed",
+        response=SimpleNamespace(
+            usage=None,
+            model_dump=lambda: {
+                "status": "completed",
+                "output": [
+                    {"type": "reasoning", "id": "rs_1", "encrypted_content": "blob-b"}
+                ],
+            },
+        ),
+    )
+    events = model._handle_event(completed, response, state)
+    assert len(events) == 1
+    assert events[0].part_index == 2
+    assert events[0].provider_metadata == {
+        "openai": {"id": "rs_1", "encrypted_content": "blob-b"}
+    }
+
+
+def test_execute_assembles_reasoning_and_text_parts(monkeypatch):
+    """End-to-end through llm 0.32's Response machinery with a fake stream."""
+    model = CodexResponsesModel("gpt-5.4")
+    stream = [
+        SimpleNamespace(
+            type="response.reasoning_summary_text.delta",
+            delta="Thinking",
+            item_id="rs_1",
+        ),
+        SimpleNamespace(
+            type="response.output_item.done",
+            item={"type": "reasoning", "id": "rs_1", "encrypted_content": "blob-a"},
+        ),
+        SimpleNamespace(type="response.output_text.delta", delta="Hello!"),
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(
+                usage={"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
+                model_dump=lambda: {
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "reasoning",
+                            "id": "rs_1",
+                            "encrypted_content": "blob-b",
+                        }
+                    ],
+                },
+            ),
+        ),
+    ]
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.responses = SimpleNamespace(create=lambda **kw: iter(stream))
+
+    monkeypatch.setattr("llm_openai_codex.openai.OpenAI", FakeClient)
+    monkeypatch.setattr("llm_openai_codex.get_codex_key", lambda: ("tok", "acct"))
+
+    response = model.prompt("Hi")
+    assert response.text() == "Hello!"
+    assert response.usage().input == 7
+    assert response.usage().output == 3
+
+    (message,) = response.messages()
+    assert message.role == "assistant"
+    reasoning_parts = [
+        part for part in message.parts if isinstance(part, ReasoningPart)
+    ]
+    text_parts = [part for part in message.parts if isinstance(part, TextPart)]
+    assert [part.text for part in text_parts] == ["Hello!"]
+    assert [part.text for part in reasoning_parts] == ["Thinking"]
+    # The final payload's ciphertext wins, so the stored part and
+    # response_json agree on one blob.
+    assert reasoning_parts[0].provider_metadata["openai"]["encrypted_content"] == (
+        "blob-b"
+    )
 
 
 def test_set_usage_tolerates_missing_token_fields():
@@ -380,7 +760,7 @@ def test_handle_event_failed_raises_model_error():
     )
     response = RecordingResponse()
     with pytest.raises(llm.ModelError, match="quota exceeded"):
-        model._handle_event(event, response)
+        model._handle_event(event, response, model._new_stream_state())
     assert response.response_json == {"status": "failed"}
 
 
@@ -394,7 +774,7 @@ def test_handle_event_incomplete_records_response_and_usage():
         ),
     )
     response = RecordingResponse()
-    assert model._handle_event(event, response) is None
+    assert model._handle_event(event, response, model._new_stream_state()) == []
     assert response.response_json == {"status": "incomplete"}
     assert response.usage == (1, 2, {})
 
@@ -403,7 +783,7 @@ def test_handle_event_error_event_raises_model_error():
     model = CodexResponsesModel("gpt-5.4")
     event = SimpleNamespace(type="error", message="bad request", code="server_error")
     with pytest.raises(llm.ModelError, match="bad request"):
-        model._handle_event(event, RecordingResponse())
+        model._handle_event(event, RecordingResponse(), model._new_stream_state())
 
 
 def test_fetch_codex_models_returns_none_without_auth():
