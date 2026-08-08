@@ -607,6 +607,65 @@ def test_handle_event_function_call_without_id_lets_llm_synthesize_one():
     assert response.tool_calls[0].tool_call_id is None
 
 
+def test_handle_event_output_item_added_streams_tool_call_name_early():
+    model = CodexResponsesModel("gpt-5.4")
+    state = model._new_stream_state()
+    added = SimpleNamespace(
+        type="response.output_item.added",
+        item={
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "get_time",
+            "arguments": "",
+        },
+    )
+    response = RecordingResponse()
+    events = model._handle_event(added, response, state)
+    assert [(e.type, e.chunk, e.tool_call_id) for e in events] == [
+        ("tool_call_name", "get_time", "call_1")
+    ]
+    # output_item.done must not repeat the name already streamed at added.
+    done = SimpleNamespace(
+        type="response.output_item.done",
+        item={
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "get_time",
+            "arguments": '{"tz": "UTC"}',
+        },
+    )
+    events = model._handle_event(done, response, state)
+    assert [(e.type, e.chunk, e.tool_call_id) for e in events] == [
+        ("tool_call_args", '{"tz": "UTC"}', "call_1")
+    ]
+    assert len(response.tool_calls) == 1
+    assert response.tool_calls[0].arguments == {"tz": "UTC"}
+
+
+def test_handle_event_output_item_added_without_call_id_defers_name():
+    model = CodexResponsesModel("gpt-5.4")
+    state = model._new_stream_state()
+    added = SimpleNamespace(
+        type="response.output_item.added",
+        item={"type": "function_call", "id": "fc_1", "name": "get_time"},
+    )
+    assert model._handle_event(added, RecordingResponse(), state) == []
+    done = SimpleNamespace(
+        type="response.output_item.done",
+        item={
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "get_time",
+            "arguments": "{}",
+        },
+    )
+    events = model._handle_event(done, RecordingResponse(), state)
+    assert [e.type for e in events] == ["tool_call_name", "tool_call_args"]
+
+
 def test_handle_event_web_search_call_yields_server_executed_events():
     model = CodexResponsesModel("gpt-5.4")
     event = SimpleNamespace(
@@ -628,6 +687,81 @@ def test_handle_event_web_search_call_yields_server_executed_events():
         ("tool_result", "completed"),
     ]
     assert events[2].tool_name == "web_search"
+
+
+def test_handle_event_completed_refreshes_web_search_events():
+    model = CodexResponsesModel("gpt-5.4")
+    state = model._new_stream_state()
+    done = SimpleNamespace(
+        type="response.output_item.done",
+        item={
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": {"query": "news"},
+        },
+    )
+    response = RecordingResponse()
+    streamed = model._handle_event(done, response, state)
+    completed = SimpleNamespace(
+        type="response.completed",
+        response=SimpleNamespace(
+            usage=None,
+            model_dump=lambda: {
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "web_search_call",
+                        "id": "ws_1",
+                        "status": "completed",
+                        "action": {"query": "news", "sources": ["python.org"]},
+                        "results": [{"url": "https://python.org", "title": "Py"}],
+                    }
+                ],
+            },
+        ),
+    )
+    assert model._handle_event(completed, response, state) == []
+    # Streamed events were updated in place with the final payload values.
+    by_type = {e.type: e for e in streamed}
+    assert json.loads(by_type["tool_call_args"].chunk) == {
+        "query": "news",
+        "sources": ["python.org"],
+    }
+    assert json.loads(by_type["tool_result"].chunk) == [
+        {"url": "https://python.org", "title": "Py"}
+    ]
+
+
+def test_handle_event_completed_with_empty_output_leaves_web_search_events():
+    # The Codex backend currently sends an empty output list in
+    # response.completed; the refresh must be a harmless no-op then.
+    model = CodexResponsesModel("gpt-5.4")
+    state = model._new_stream_state()
+    done = SimpleNamespace(
+        type="response.output_item.done",
+        item={
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": {"query": "news"},
+        },
+    )
+    response = RecordingResponse()
+    streamed = model._handle_event(done, response, state)
+    completed = SimpleNamespace(
+        type="response.completed",
+        response=SimpleNamespace(
+            usage=None,
+            model_dump=lambda: {"status": "completed", "output": []},
+        ),
+    )
+    assert model._handle_event(completed, response, state) == []
+    assert [(e.type, e.chunk) for e in streamed] == [
+        ("tool_call_name", "web_search"),
+        ("tool_call_args", '{"query": "news"}'),
+        ("tool_result", "completed"),
+    ]
 
 
 def test_handle_event_completed_sets_response_json_and_usage():

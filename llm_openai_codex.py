@@ -1243,13 +1243,52 @@ class _SharedCodexResponses:
             # output_item.done, so the refresh after response.completed can
             # target the part that event resolved to.
             "reasoning_done": {},
+            # Function-call item ids whose tool name already streamed at
+            # output_item.added, so output_item.done emits only the args.
+            "tool_name_streamed": set(),
+            # web_search_call item id -> the StreamEvents yielded at
+            # output_item.done, so response.completed can refresh their
+            # chunks with the final payload's values.
+            "web_search_done": {},
         }
 
+    @staticmethod
+    def _item_data(item):
+        if hasattr(item, "model_dump"):
+            return item.model_dump()
+        if isinstance(item, dict):
+            return item
+        return getattr(item, "__dict__", {}) or {}
+
     def _handle_event(self, event, response, state):
-        """Translate one Responses API stream event into StreamEvents."""
+        """Translate one Responses API stream event into StreamEvents.
+
+        Function-call tool names stream early, at output_item.added, so a
+        pending tool call is visible before its arguments finish
+        generating; output_item.done then emits only the arguments.
+        """
         et = getattr(event, "type", None)
         if et == "response.output_text.delta":
             return [StreamEvent(type="text", chunk=event.delta or "")]
+
+        if et == "response.output_item.added":
+            data = self._item_data(event.item)
+            item_id = data.get("id")
+            tool_id = data.get("call_id")
+            name = data.get("name")
+            if (
+                data.get("type") == "function_call"
+                and item_id
+                and tool_id
+                and name
+            ):
+                state["tool_name_streamed"].add(item_id)
+                return [
+                    StreamEvent(
+                        type="tool_call_name", chunk=name, tool_call_id=tool_id
+                    )
+                ]
+            return []
 
         if et in (
             "response.reasoning_summary_text.delta",
@@ -1273,13 +1312,7 @@ class _SharedCodexResponses:
             return []
 
         if et == "response.output_item.done":
-            item = event.item
-            if hasattr(item, "model_dump"):
-                data = item.model_dump()
-            elif isinstance(item, dict):
-                data = item
-            else:
-                data = getattr(item, "__dict__", {}) or {}
+            data = self._item_data(event.item)
             return self._output_item_done_events(data, response, state)
 
         if et in ("response.completed", "response.incomplete", "response.failed"):
@@ -1290,6 +1323,9 @@ class _SharedCodexResponses:
                 message = getattr(error, "message", None) or "Codex response failed."
                 raise llm.ModelError(message)
             if et == "response.completed":
+                self._refresh_web_search_events(
+                    response.response_json, state["web_search_done"]
+                )
                 return self._reasoning_refresh_events(
                     response.response_json, state["reasoning_done"]
                 )
@@ -1319,12 +1355,19 @@ class _SharedCodexResponses:
                     arguments=parsed,
                 )
             )
-            return [
-                StreamEvent(type="tool_call_name", chunk=name, tool_call_id=tool_id),
+            events = []
+            if data.get("id") not in state["tool_name_streamed"]:
+                events.append(
+                    StreamEvent(
+                        type="tool_call_name", chunk=name, tool_call_id=tool_id
+                    )
+                )
+            events.append(
                 StreamEvent(
                     type="tool_call_args", chunk=arguments, tool_call_id=tool_id
-                ),
-            ]
+                )
+            )
+            return events
         if item_type == "reasoning":
             item_id = data.get("id")
             reasoning_event = self._reasoning_event(
@@ -1335,7 +1378,11 @@ class _SharedCodexResponses:
                 state["reasoning_done"][item_id] = reasoning_event
             return [reasoning_event]
         if item_type == "web_search_call":
-            return self._web_search_events(data)
+            events = self._web_search_events(data)
+            item_id = data.get("id")
+            if item_id:
+                state["web_search_done"][item_id] = events
+            return events
         return []
 
     def _reasoning_event(self, data, include_text=True):
@@ -1399,11 +1446,41 @@ class _SharedCodexResponses:
                 )
         return events
 
+    def _refresh_web_search_events(self, response_json, done_events):
+        """
+        Replace streamed web_search payloads with their final values.
+
+        OpenAI can send incomplete action/results on output_item.done and
+        the complete item on response.completed. Yielded StreamEvent
+        objects are stored by reference, so updating their chunks here
+        corrects the assembled parts without emitting duplicate events
+        (same approach as llm core's _refresh_server_tool_events).
+
+        The Codex backend currently returns an empty output list in
+        response.completed, which makes this a no-op there; it is kept for
+        parity with llm core and as insurance against backend changes.
+        """
+        for item in (response_json or {}).get("output") or []:
+            if not isinstance(item, dict) or item.get("type") != "web_search_call":
+                continue
+            prior_events = done_events.get(item.get("id"))
+            if not prior_events:
+                continue
+            final_events = {
+                event.type: event for event in self._web_search_events(item)
+            }
+            for prior in prior_events:
+                final = final_events.get(prior.type)
+                if final is not None:
+                    prior.chunk = final.chunk
+
     def _web_search_events(self, data):
         """
         server_executed events for a web_search_call output item so the
         search is recorded in the message parts without entering the
-        locally-executable tool call list.
+        locally-executable tool call list. The events are retained in
+        stream state so _refresh_web_search_events can update them with
+        the final payload after response.completed.
         """
         tool_id = data.get("id")
         results = data.get("results") or []

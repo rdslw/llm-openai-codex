@@ -18,6 +18,8 @@ LLM plugin for accessing ChatGPT/Codex-backed OpenAI models through the Response
   with LLM's built-in OpenAI models) or `-o web_search 1`.
 - Streams visible reasoning summaries and round-trips encrypted reasoning
   between turns (requires LLM 0.32 or later).
+- Tool call names stream as soon as the model starts a call, before the
+  arguments finish generating.
 
 ## Installation
 
@@ -120,7 +122,10 @@ llm -m codex/gpt-5.6-luna -T 'WebSearch(allowed_domains=["python.org"], search_c
 index. Run `llm tools -m codex/gpt-5.6-luna` to see every constructor
 argument, including domain filters, user location, and image search.
 Conversations continued with `llm -c` restore the configured tool
-automatically. Raw provider specifications also work, for server-side tools
+automatically. Searches are recorded in the conversation log as
+server-executed tool calls; when the final response payload carries more
+complete search data than the stream did, the recorded values are
+refreshed from it. Raw provider specifications also work, for server-side tools
 the plugin does not know about yet:
 
 ```bash
