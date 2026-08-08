@@ -15,19 +15,26 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false  # run all matrix jobs — see every Python version that breaks
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
     - uses: actions/checkout@v5
+    # setup-python must come before uv: uv's .venv uses the interpreter it
+    # finds on PATH — that's what makes the version matrix real.
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v6
       with:
         python-version: ${{ matrix.python-version }}
-        cache: pip
-        cache-dependency-path: pyproject.toml
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v6
+      with:
+        enable-cache: true  # caches downloaded wheels across runs
+    # uv.lock is untracked (library mode): deps resolve fresh each run, so CI
+    # fails loudly when a new llm release breaks us.
+    # OLD: pip install . --group dev
     - name: Install dependencies
-      run: |
-        pip install . --group dev
+      run: uv sync --all-groups
+    # OLD: python -m pytest
     - name: Run tests
-      run: |
-        python -m pytest
+      run: uv run pytest
