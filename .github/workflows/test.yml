@@ -1,6 +1,12 @@
 name: Test
 
-on: [push, pull_request]
+# Tags are deliberately not a trigger: release tags point at commits already
+# tested on main, and publish.yml re-tests the tagged code in its own test job
+# before publishing. PR branches are covered by the pull_request event alone.
+on:
+  push:
+    branches: [main]
+  pull_request:
 
 permissions:
   contents: read
