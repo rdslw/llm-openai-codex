@@ -23,6 +23,7 @@ import pytest
 from llm_openai_codex import (
     AUTH_MISSING_MESSAGE,
     AUTH_RECOVERY_MESSAGE,
+    AsyncCodexResponsesModel,
     BorrowKeyError,
     CodexResponsesModel,
     DEFAULT_MODELS,
@@ -55,6 +56,7 @@ from llm_openai_codex import (
     _write_auth,
     get_codex_key,
     codex,
+    ReasoningSummaryEnum,
 )
 
 
@@ -147,6 +149,47 @@ def test_build_kwargs_reasoning_effort_survives_hide_reasoning():
     model = CodexResponsesModel("gpt-5.4")
     prompt = llm.Prompt(model=model, prompt="Hello", hide_reasoning=True)
     prompt.options = model.Options(reasoning_effort="high")
+    kwargs = model._build_kwargs(prompt)
+    assert kwargs["reasoning"] == {"effort": "high"}
+
+
+def test_build_kwargs_reasoning_summary():
+    model = CodexResponsesModel("gpt-5.4")
+    for val in ("auto", "concise", "detailed"):
+        prompt = llm.Prompt(model=model, prompt="Hello")
+        prompt.options = model.Options(reasoning_summary=val)
+        kwargs = model._build_kwargs(prompt)
+        assert kwargs["reasoning"] == {"summary": val}
+
+
+def test_build_kwargs_reasoning_summary_enum():
+    model = CodexResponsesModel("gpt-5.4")
+    prompt = llm.Prompt(model=model, prompt="Hello")
+    prompt.options = model.Options(reasoning_summary=ReasoningSummaryEnum.concise)
+    kwargs = model._build_kwargs(prompt)
+    assert kwargs["reasoning"] == {"summary": "concise"}
+
+
+def test_build_kwargs_reasoning_summary_suppressed_by_hide_reasoning():
+    model = CodexResponsesModel("gpt-5.4")
+    prompt = llm.Prompt(model=model, prompt="Hello", hide_reasoning=True)
+    prompt.options = model.Options(reasoning_summary="concise")
+    kwargs = model._build_kwargs(prompt)
+    assert "reasoning" not in kwargs
+
+
+def test_build_kwargs_reasoning_summary_with_effort():
+    model = CodexResponsesModel("gpt-5.4")
+    prompt = llm.Prompt(model=model, prompt="Hello")
+    prompt.options = model.Options(reasoning_summary="concise", reasoning_effort="high")
+    kwargs = model._build_kwargs(prompt)
+    assert kwargs["reasoning"] == {"summary": "concise", "effort": "high"}
+
+
+def test_build_kwargs_reasoning_summary_with_effort_and_hide_reasoning():
+    model = CodexResponsesModel("gpt-5.4")
+    prompt = llm.Prompt(model=model, prompt="Hello", hide_reasoning=True)
+    prompt.options = model.Options(reasoning_summary="concise", reasoning_effort="high")
     kwargs = model._build_kwargs(prompt)
     assert kwargs["reasoning"] == {"effort": "high"}
 
@@ -811,7 +854,7 @@ def test_handle_event_completed_reemits_reasoning_metadata_from_final_payload():
 
 
 def test_execute_assembles_reasoning_and_text_parts(monkeypatch):
-    """End-to-end through llm 0.32's Response machinery with a fake stream."""
+    """End-to-end through LLM 0.32+'s Response machinery with a fake stream."""
     model = CodexResponsesModel("gpt-5.4")
     stream = [
         SimpleNamespace(
@@ -867,6 +910,60 @@ def test_execute_assembles_reasoning_and_text_parts(monkeypatch):
     assert reasoning_parts[0].provider_metadata["openai"]["encrypted_content"] == (
         "blob-b"
     )
+
+
+def test_execute_passes_reasoning_summary_option(monkeypatch):
+    model = CodexResponsesModel("gpt-5.4")
+    recorded_kwargs = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            def fake_create(**kw):
+                recorded_kwargs.update(kw)
+                return iter([])
+
+            self.responses = SimpleNamespace(create=fake_create)
+
+    monkeypatch.setattr("llm_openai_codex.openai.OpenAI", FakeClient)
+    monkeypatch.setattr("llm_openai_codex.get_codex_key", lambda: ("tok", "acct"))
+
+    response = model.prompt("Hi", options={"reasoning_summary": "concise"})
+    list(response)
+
+    assert "reasoning_summary" not in recorded_kwargs
+    assert recorded_kwargs["reasoning"] == {"summary": "concise"}
+
+
+def test_execute_async_passes_reasoning_summary_option(monkeypatch):
+    import asyncio
+
+    model = AsyncCodexResponsesModel("gpt-5.4")
+    recorded_kwargs = {}
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            async def fake_create(**kw):
+                recorded_kwargs.update(kw)
+
+                async def async_iter():
+                    if False:
+                        yield None
+
+                return async_iter()
+
+            self.responses = SimpleNamespace(create=fake_create)
+
+    monkeypatch.setattr("llm_openai_codex.openai.AsyncOpenAI", FakeAsyncClient)
+    monkeypatch.setattr("llm_openai_codex.get_codex_key", lambda: ("tok", "acct"))
+
+    async def run():
+        response = model.prompt("Hi", options={"reasoning_summary": "detailed"})
+        await response.text()
+
+    asyncio.run(run())
+
+    assert "reasoning_summary" not in recorded_kwargs
+    assert recorded_kwargs["reasoning"] == {"summary": "detailed"}
 
 
 def test_set_usage_tolerates_missing_token_fields():

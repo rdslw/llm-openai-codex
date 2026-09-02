@@ -933,6 +933,12 @@ class ReasoningEffortEnum(str, Enum):
     xhigh = "xhigh"
 
 
+class ReasoningSummaryEnum(str, Enum):
+    auto = "auto"
+    concise = "concise"
+    detailed = "detailed"
+
+
 class VerbosityEnum(str, Enum):
     low = "low"
     medium = "medium"
@@ -970,6 +976,10 @@ class CodexOptions(Options):
     )
     reasoning_effort: Optional[ReasoningEffortEnum] = Field(
         description="Reasoning effort level: low, medium, high, or xhigh.",
+        default=None,
+    )
+    reasoning_summary: Optional[ReasoningSummaryEnum] = Field(
+        description="Reasoning summary level: auto, concise, or detailed.",
         default=None,
     )
     verbosity: Optional[VerbosityEnum] = Field(
@@ -1157,12 +1167,17 @@ class _SharedCodexResponses:
                 kwargs[option] = value
 
         reasoning = {}
+        reasoning_summary = getattr(prompt.options, "reasoning_summary", None)
         if not getattr(prompt, "hide_reasoning", False):
             # Codex models are all reasoning models; request visible
             # summaries unless the caller passed hide_reasoning / -R.
-            reasoning["summary"] = "auto"
+            if reasoning_summary is not None and hasattr(reasoning_summary, "value"):
+                reasoning_summary = reasoning_summary.value
+            reasoning["summary"] = reasoning_summary or "auto"
         reasoning_effort = getattr(prompt.options, "reasoning_effort", None)
         if reasoning_effort is not None:
+            if hasattr(reasoning_effort, "value"):
+                reasoning_effort = reasoning_effort.value
             reasoning["effort"] = reasoning_effort
         if reasoning:
             kwargs["reasoning"] = reasoning

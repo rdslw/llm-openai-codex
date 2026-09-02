@@ -101,6 +101,19 @@ Image attachments (`-a image.png`) are sent at low detail to limit token use.
 
 Codex models are reasoning models. Visible reasoning summaries stream to
 standard error while a response runs; hide them with `-R`/`--hide-reasoning`.
+Customize the summary detail level with `-o reasoning_summary auto|concise|detailed`
+(defaults to `auto`):
+
+```bash
+llm -m codex/gpt-5.6-luna -o reasoning_summary concise "Explain quantum computing"
+```
+
+Reasoning effort can also be adjusted with `-o reasoning_effort low|medium|high|xhigh`:
+
+```bash
+llm -m codex/gpt-5.6-luna -o reasoning_effort high "Solve this puzzle"
+```
+
 Requests run stateless (`store: false`), so the plugin asks the API for
 encrypted reasoning items and echoes them back on later turns. The model keeps
 its chain of thought across tool calls and continued conversations
