@@ -19,6 +19,7 @@ from llm.parts import (
     ToolResultPart,
 )
 import pytest
+from pydantic import ValidationError
 
 from llm_openai_codex import (
     AUTH_MISSING_MESSAGE,
@@ -215,9 +216,154 @@ def test_build_kwargs_verbosity_and_schema():
 def test_build_kwargs_forwards_extra_options():
     model = CodexResponsesModel("gpt-5.4")
     prompt = llm.Prompt(model=model, prompt="Hello")
-    prompt.options = model.Options(service_tier="flex")
+    prompt.options = model.Options(parallel_tool_calls=False)
     kwargs = model._build_kwargs(prompt)
-    assert kwargs["service_tier"] == "flex"
+    assert kwargs["parallel_tool_calls"] is False
+
+
+@pytest.mark.parametrize("model_class", [CodexResponsesModel, AsyncCodexResponsesModel])
+@pytest.mark.parametrize(
+    "tier,expected",
+    [
+        (None, None),
+        ("auto", "auto"),
+        ("default", "default"),
+        ("flex", "flex"),
+        ("scale", "scale"),
+        ("priority", "priority"),
+        ("fast", "priority"),
+        ("ultrafast", "ultrafast"),
+    ],
+)
+def test_build_kwargs_service_tier(model_class, tier, expected):
+    model = model_class("gpt-5.5")
+    prompt = llm.Prompt(model=model, prompt="Hello")
+    prompt.options = model.Options(service_tier=tier, reasoning_effort="high")
+    kwargs = model._build_kwargs(prompt)
+    if expected is None:
+        assert "service_tier" not in kwargs
+    else:
+        assert kwargs["service_tier"] == expected
+        assert type(kwargs["service_tier"]) is str
+    assert kwargs["reasoning"]["effort"] == "high"
+    assert kwargs["store"] is False
+
+
+@pytest.mark.parametrize("tier", ["turbo", "", "FAST", 1, True])
+def test_service_tier_rejects_invalid_values(tier):
+    model = CodexResponsesModel("gpt-5.5")
+    with pytest.raises(ValidationError, match="service_tier"):
+        model.Options(service_tier=tier)
+
+
+def test_service_tier_cli_defaults(monkeypatch):
+    from llm.cli import cli, get_model_options, render_model_with_options
+
+    monkeypatch.setattr("llm_openai_codex._model_names_for_registration", lambda: ["gpt-5.5"])
+    model = llm.get_model("codex/gpt-5.5")
+    runner = CliRunner()
+    assert "service_tier" in render_model_with_options(model.model_id)
+    result = runner.invoke(
+        cli, ["models", "options", "set", model.model_id, "service_tier", "fast"]
+    )
+    assert result.exit_code == 0, result.output
+    saved = get_model_options(model.model_id)
+    assert saved == {"service_tier": "fast"}
+    monkeypatch.setattr("llm_openai_codex.get_codex_key", lambda: ("tok", "acct"))
+    with patch("llm_openai_codex.openai.OpenAI") as client:
+        create = client.return_value.responses.create
+        create.side_effect = lambda **kwargs: iter([])
+        result = runner.invoke(cli, ["-m", model.model_id, "--no-log", "Hello"])
+        assert result.exit_code == 0, result.output
+        assert create.call_args.kwargs["service_tier"] == "priority"
+        result = runner.invoke(
+            cli,
+            ["-m", model.model_id, "--no-log", "-o", "service_tier", "default", "Hello"],
+        )
+        assert result.exit_code == 0, result.output
+        assert create.call_args.kwargs["service_tier"] == "default"
+    assert get_model_options(model.model_id) == saved
+
+    result = runner.invoke(
+        cli, ["models", "options", "set", model.model_id, "service_tier", "turbo"]
+    )
+    assert result.exit_code != 0
+    assert "service_tier" in result.output
+    assert get_model_options(model.model_id) == saved
+
+    result = runner.invoke(
+        cli, ["models", "options", "clear", model.model_id, "service_tier"]
+    )
+    assert result.exit_code == 0, result.output
+    assert get_model_options(model.model_id) == {}
+
+
+@pytest.mark.parametrize("async_", [False, True])
+@pytest.mark.parametrize("reject", [False, True])
+def test_execute_service_tier(monkeypatch, async_, reject):
+    import asyncio
+    import httpx
+    import openai
+
+    calls = []
+    error_message = "The requested service tier is not available for this model"
+    error = openai.BadRequestError(
+        error_message,
+        response=httpx.Response(
+            400, request=httpx.Request("POST", "https://example.test/responses")
+        ),
+        body={"error": {"message": error_message, "param": "service_tier"}},
+    )
+
+    def record(kwargs):
+        calls.append(kwargs)
+        if reject:
+            raise error
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.responses = self
+
+        def create(self, **kwargs):
+            record(kwargs)
+            return iter([])
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.responses = self
+
+        async def create(self, **kwargs):
+            record(kwargs)
+
+            async def events():
+                if False:
+                    yield None
+
+            return events()
+
+    monkeypatch.setattr("llm_openai_codex.openai.OpenAI", FakeClient)
+    monkeypatch.setattr("llm_openai_codex.openai.AsyncOpenAI", FakeAsyncClient)
+    monkeypatch.setattr("llm_openai_codex.get_codex_key", lambda: ("tok", "acct"))
+
+    def run():
+        if async_:
+            async def run_async():
+                model = AsyncCodexResponsesModel("gpt-5.5")
+                await model.prompt("Hello", options={"service_tier": "fast"}).text()
+
+            asyncio.run(run_async())
+        else:
+            model = CodexResponsesModel("gpt-5.5")
+            model.prompt("Hello", options={"service_tier": "fast"}).text()
+
+    if reject:
+        with pytest.raises(openai.BadRequestError, match=error_message) as exc:
+            run()
+        assert exc.value is error
+    else:
+        run()
+    assert len(calls) == 1
+    assert calls[0]["service_tier"] == "priority"
 
 
 def test_build_kwargs_web_search():

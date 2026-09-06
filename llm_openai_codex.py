@@ -951,9 +951,27 @@ class WebSearchContextSizeEnum(str, Enum):
     high = "high"
 
 
+class ServiceTierEnum(str, Enum):
+    auto = "auto"
+    default = "default"
+    flex = "flex"
+    scale = "scale"
+    priority = "priority"
+    fast = "fast"
+    ultrafast = "ultrafast"
+
+
 class CodexOptions(Options):
     model_config = ConfigDict(extra="allow")
 
+    service_tier: Optional[ServiceTierEnum] = Field(
+        description=(
+            "Processing tier: auto, default, flex, scale, priority, fast, or "
+            "ultrafast. fast is an alias for priority (Fast mode, higher credit "
+            "consumption). Availability depends on the model and account."
+        ),
+        default=None,
+    )
     max_output_tokens: Optional[int] = Field(
         description="Upper bound for tokens in the response.",
         ge=0,
@@ -1165,6 +1183,13 @@ class _SharedCodexResponses:
             value = getattr(prompt.options, option, None)
             if value is not None:
                 kwargs[option] = value
+
+        service_tier = getattr(prompt.options, "service_tier", None)
+        if service_tier is not None:
+            service_tier = ServiceTierEnum(service_tier).value
+            kwargs["service_tier"] = (
+                "priority" if service_tier == "fast" else service_tier
+            )
 
         reasoning = {}
         reasoning_summary = getattr(prompt.options, "reasoning_summary", None)

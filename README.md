@@ -97,6 +97,35 @@ llm -m codex/gpt-5.6-terra -o verbosity low "Summarize this"
 
 Image attachments (`-a image.png`) are sent at low detail to limit token use.
 
+## Fast mode and service tiers
+
+Select Fast mode with `-o service_tier fast` (an alias for `priority`):
+
+```bash
+llm -m codex/gpt-5.5 -o service_tier fast "Review this code"
+
+# Save Fast mode as the default for this model
+llm models options set codex/gpt-5.5 service_tier priority
+
+# Override the saved setting for one request with standard processing
+llm -m codex/gpt-5.5 -o service_tier default "Explain this function"
+
+# Remove the saved default
+llm models options clear codex/gpt-5.5 service_tier
+```
+
+Fast mode requests faster processing of the same model at higher ChatGPT credit
+consumption. See [OpenAI's Codex speed documentation](https://learn.chatgpt.com/docs/agent-configuration/speed)
+for current availability and credit rates.
+
+`service_tier` accepts `auto`, `default`, `flex`, `scale`, `priority`, `fast`,
+and `ultrafast`. The plugin sends `fast` as `priority` and forwards the other
+values unchanged. These values are validated locally; support depends on the
+Codex backend, model, and account. Unsupported tiers retain the backend's error;
+the plugin does not retry with another tier. When no option or saved default is
+set, the plugin omits `service_tier`, preserving the backend's default behavior.
+Reasoning effort is configured separately.
+
 ## Reasoning
 
 Codex models are reasoning models. Visible reasoning summaries stream to
