@@ -138,12 +138,15 @@ def test_build_kwargs_with_options():
     assert kwargs["top_p"] == 0.9
 
 
-def test_build_kwargs_reasoning_effort():
-    model = CodexResponsesModel("gpt-5.4")
+@pytest.mark.parametrize("model_class", [CodexResponsesModel, AsyncCodexResponsesModel])
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
+def test_build_kwargs_reasoning_effort(model_class, effort):
+    model = model_class("gpt-6-astra")
     prompt = llm.Prompt(model=model, prompt="Hello")
-    prompt.options = model.Options(reasoning_effort="high")
+    prompt.options = model.Options(reasoning_effort=effort)
     kwargs = model._build_kwargs(prompt)
-    assert kwargs["reasoning"] == {"summary": "auto", "effort": "high"}
+    assert kwargs["model"] == "gpt-6-astra"
+    assert kwargs["reasoning"] == {"summary": "auto", "effort": effort}
 
 
 def test_build_kwargs_reasoning_effort_survives_hide_reasoning():
@@ -300,7 +303,8 @@ def test_service_tier_cli_defaults(monkeypatch):
 
 @pytest.mark.parametrize("async_", [False, True])
 @pytest.mark.parametrize("reject", [False, True])
-def test_execute_service_tier(monkeypatch, async_, reject):
+@pytest.mark.parametrize("model_name", ["gpt-5.5", "gpt-6-astra"])
+def test_execute_service_tier(monkeypatch, async_, reject, model_name):
     import asyncio
     import httpx
     import openai
@@ -348,12 +352,12 @@ def test_execute_service_tier(monkeypatch, async_, reject):
     def run():
         if async_:
             async def run_async():
-                model = AsyncCodexResponsesModel("gpt-5.5")
+                model = AsyncCodexResponsesModel(model_name)
                 await model.prompt("Hello", options={"service_tier": "fast"}).text()
 
             asyncio.run(run_async())
         else:
-            model = CodexResponsesModel("gpt-5.5")
+            model = CodexResponsesModel(model_name)
             model.prompt("Hello", options={"service_tier": "fast"}).text()
 
     if reject:
@@ -363,6 +367,7 @@ def test_execute_service_tier(monkeypatch, async_, reject):
     else:
         run()
     assert len(calls) == 1
+    assert calls[0]["model"] == model_name
     assert calls[0]["service_tier"] == "priority"
 
 
@@ -1219,12 +1224,36 @@ def test_stale_cache_beats_failed_fetch():
 
 def test_fallback_models_include_known_models():
     assert {
+        "gpt-6-astra",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
         "gpt-5.5",
         "gpt-5.3-codex-spark",
     } <= set(DEFAULT_MODELS)
+
+
+@pytest.mark.parametrize("discovered", [[], ["gpt-5.5"], ["gpt-5.5", "gpt-6-astra"]])
+def test_astra_registration_from_cache_and_fallback(discovered):
+    from llm_openai_codex import register_models
+
+    _models_cache_path().write_text(
+        json.dumps({"fetched_at": time.time(), "models": discovered})
+    )
+    registered = []
+    with patch("llm_openai_codex._fetch_codex_models") as fetch:
+        register_models(lambda model, async_model: registered.append((model, async_model)))
+    fetch.assert_not_called()
+    ids = [model.model_id for model, _ in registered]
+    assert ids.count("codex/gpt-6-astra") == 1
+    assert ids[:len(discovered)] == ["codex/" + name for name in discovered]
+    model, async_model = next(
+        pair for pair in registered if pair[0].model_id == "codex/gpt-6-astra"
+    )
+    assert isinstance(model, CodexResponsesModel)
+    assert isinstance(async_model, AsyncCodexResponsesModel)
+    assert async_model.model_id == model.model_id
+    assert model.model_name == async_model.model_name == "gpt-6-astra"
 
 
 def test_model_registration_includes_defaults_when_discovery_succeeds():

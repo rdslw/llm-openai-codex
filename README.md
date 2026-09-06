@@ -88,6 +88,15 @@ llm models -q codex
 
 Models are discovered from the Codex API and combined with known hidden/fallback slugs. Availability depends on your plan; a listed fallback may still fail at request time. Discovery is cached for 24 hours in `codex_models.json` in LLM's user config directory; delete it to force a re-fetch.
 
+`codex/gpt-6-astra` is included as a fallback, so it is available for selection
+even when the cached discovery list does not include it. Access depends on your
+account and the rollout; see [OpenAI's Codex model documentation](https://learn.chatgpt.com/docs/models#gpt-6-astra).
+
+```bash
+llm -m codex/gpt-6-astra "Review this code"
+llm -m codex/gpt-6-astra -o reasoning_effort max "Analyze this difficult problem"
+```
+
 Run a prompt and optionally set Responses API verbosity:
 
 ```bash
@@ -137,7 +146,8 @@ Customize the summary detail level with `-o reasoning_summary auto|concise|detai
 llm -m codex/gpt-5.6-luna -o reasoning_summary concise "Explain quantum computing"
 ```
 
-Reasoning effort can also be adjusted with `-o reasoning_effort low|medium|high|xhigh`:
+Reasoning effort can also be adjusted with `-o reasoning_effort low|medium|high|xhigh|max`.
+Supported levels depend on the model; GPT-6 Astra supports all five.
 
 ```bash
 llm -m codex/gpt-5.6-luna -o reasoning_effort high "Solve this puzzle"

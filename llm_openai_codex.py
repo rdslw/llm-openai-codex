@@ -661,6 +661,7 @@ def _device_code_login():
 # --- Fetch available models from the Codex endpoint ---
 
 DEFAULT_MODELS = [
+    "gpt-6-astra",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
@@ -931,6 +932,7 @@ class ReasoningEffortEnum(str, Enum):
     medium = "medium"
     high = "high"
     xhigh = "xhigh"
+    max = "max"
 
 
 class ReasoningSummaryEnum(str, Enum):
@@ -993,7 +995,10 @@ class CodexOptions(Options):
         default=None,
     )
     reasoning_effort: Optional[ReasoningEffortEnum] = Field(
-        description="Reasoning effort level: low, medium, high, or xhigh.",
+        description=(
+            "Reasoning effort level: low, medium, high, xhigh, or max. "
+            "Supported levels depend on the model."
+        ),
         default=None,
     )
     reasoning_summary: Optional[ReasoningSummaryEnum] = Field(
