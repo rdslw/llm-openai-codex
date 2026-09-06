@@ -306,15 +306,16 @@ def test_service_tier_cli_defaults(monkeypatch):
 @pytest.mark.parametrize("model_name", ["gpt-5.5", "gpt-6-astra"])
 def test_execute_service_tier(monkeypatch, async_, reject, model_name):
     import asyncio
-    import httpx
     import openai
 
     calls = []
     error_message = "The requested service tier is not available for this model"
     error = openai.BadRequestError(
         error_message,
-        response=httpx.Response(
-            400, request=httpx.Request("POST", "https://example.test/responses")
+        response=SimpleNamespace(
+            status_code=400,
+            request=SimpleNamespace(method="POST", url="https://example.test/responses"),
+            headers={},
         ),
         body={"error": {"message": error_message, "param": "service_tier"}},
     )

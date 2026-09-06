@@ -17,7 +17,7 @@ LLM plugin for accessing ChatGPT/Codex-backed OpenAI models through the Response
 - Added OpenAI's server-side `web_search` tool via `-T WebSearch` (shared
   with LLM's built-in OpenAI models) or `-o web_search 1`.
 - Streams visible reasoning summaries and round-trips encrypted reasoning
-  between turns (requires LLM 0.32 or later).
+  between turns.
 - Tool call names stream as soon as the model starts a call, before the
   arguments finish generating.
 
@@ -28,6 +28,11 @@ Install the plugin in the same environment as [LLM](https://llm.datasette.io/):
 ```bash
 llm install llm-openai-codex
 ```
+
+Requires LLM 0.34 or later and OpenAI Python SDK newer than 3.0.0, following
+LLM's `httpx2` dependency stack. Installation resolves these dependencies
+automatically. The plugin uses the SDK's HTTP client; it does not require a
+separate `httpx` installation.
 
 ## Authentication: plugin-owned or borrowed
 
