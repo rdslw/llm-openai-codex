@@ -25,6 +25,16 @@
 - Reasoning metadata (`id`, `encrypted_content`, `summary`) round-trips via
   `provider_metadata["openai"]` on `ReasoningPart` objects; requests stay
   stateless with `store: false`.
+- A request sends its prompt cache key (the `prompt_cache_key` option, else
+  the LLM conversation ID) as the `session-id` header, merged into any
+  `extra_headers`, and as `prompt_cache_key`. The backend takes the key from
+  the header and ignores a body-only key; without the header it assigns a
+  random key per request and no request gets cache hits. Without a
+  conversation and without the option (`model.prompt()`, `Response.reply()`),
+  no key is sent; this is intentional for now and documented in `README.md`.
+  The option accepts only valid header values (printable ASCII).
+- `usage.attribution` (a per-item token breakdown that grows with the
+  conversation) is removed from `response_json` and from the token details.
 - Entries in `DEFAULT_MODELS` are raw API slugs without `codex/`; registration
   adds the prefix.
 - Registration combines models discovered from the Codex API with hardcoded

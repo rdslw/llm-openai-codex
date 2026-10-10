@@ -90,6 +90,90 @@ def write_codex_cli_auth(tmp_path, monkeypatch, data):
     return path
 
 
+@pytest.fixture
+def fake_openai(monkeypatch):
+    """
+    Replace the sync and async OpenAI SDK clients. responses.create records
+    its kwargs in .calls and returns the next event list from .streams (no
+    events when .streams is empty); when .error is set, it raises .error.
+    """
+    fake = SimpleNamespace(calls=[], streams=[], error=None)
+
+    def record(kwargs):
+        fake.calls.append(kwargs)
+        if fake.error:
+            raise fake.error
+        return fake.streams.pop(0) if fake.streams else []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.responses = self
+
+        def create(self, **kwargs):
+            return iter(record(kwargs))
+
+    class FakeAsyncClient(FakeClient):
+        async def create(self, **kwargs):
+            events = record(kwargs)
+
+            async def stream():
+                for event in events:
+                    yield event
+
+            return stream()
+
+    monkeypatch.setattr("llm_openai_codex.openai.OpenAI", FakeClient)
+    monkeypatch.setattr("llm_openai_codex.openai.AsyncOpenAI", FakeAsyncClient)
+    monkeypatch.setattr("llm_openai_codex.get_codex_key", lambda: ("tok", "acct"))
+    return fake
+
+
+USAGE_WITH_CACHED_TOKENS = {
+    "input_tokens": 5471,
+    "input_tokens_details": {"cache_write_tokens": 0, "cached_tokens": 4864},
+    "output_tokens": 5,
+    "output_tokens_details": {"reasoning_tokens": 0},
+    "total_tokens": 5476,
+}
+
+# Live shape of the Codex backend's usage.attribution (not in the SDK types).
+USAGE_ATTRIBUTION = {
+    "items": {
+        "msg_1": {
+            "input_tokens": 11,
+            "cached_tokens": 0,
+            "content": [{"input_tokens": 11, "cached_tokens": 0}],
+        }
+    },
+    "request_fields": {"instructions": {"input_tokens": 5460, "cached_tokens": 4864}},
+}
+
+
+def sdk_completed_event(usage, prompt_cache_key=None):
+    """A response.completed event parsed by the real SDK models."""
+    from openai.types.responses import ResponseCompletedEvent
+
+    return ResponseCompletedEvent.model_validate(
+        {
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_1",
+                "object": "response",
+                "created_at": 1,
+                "model": "gpt-5.5",
+                "status": "completed",
+                "output": [],
+                "parallel_tool_calls": True,
+                "tool_choice": "auto",
+                "tools": [],
+                "prompt_cache_key": prompt_cache_key,
+                "usage": usage,
+            },
+        }
+    )
+
+
 def test_model_metadata():
     model = CodexResponsesModel("gpt-5.4")
     assert model.model_id == "codex/gpt-5.4"
@@ -225,6 +309,223 @@ def test_build_kwargs_forwards_extra_options():
 
 
 @pytest.mark.parametrize("model_class", [CodexResponsesModel, AsyncCodexResponsesModel])
+def test_build_kwargs_prompt_cache_key_uses_conversation_id(model_class):
+    model = model_class("gpt-5.4")
+    prompt = llm.Prompt(model=model, prompt="Hello")
+    kwargs = model._build_kwargs(prompt, SimpleNamespace(id="01conversation"))
+    assert kwargs["prompt_cache_key"] == "01conversation"
+    assert kwargs["extra_headers"] == {"session-id": "01conversation"}
+
+
+def test_build_kwargs_prompt_cache_key_option_wins():
+    model = CodexResponsesModel("gpt-5.4")
+    prompt = llm.Prompt(model=model, prompt="Hello")
+    prompt.options = model.Options(prompt_cache_key="shared-doc")
+    kwargs = model._build_kwargs(prompt, SimpleNamespace(id="01conversation"))
+    assert kwargs["prompt_cache_key"] == "shared-doc"
+    assert kwargs["extra_headers"] == {"session-id": "shared-doc"}
+
+
+def test_build_kwargs_without_conversation_sends_no_prompt_cache_key():
+    model = CodexResponsesModel("gpt-5.4")
+    prompt = llm.Prompt(model=model, prompt="Hello")
+    kwargs = model._build_kwargs(prompt)
+    assert "prompt_cache_key" not in kwargs
+    assert "extra_headers" not in kwargs
+    # The option still sets a key without a conversation.
+    prompt.options = model.Options(prompt_cache_key="shared-doc")
+    kwargs = model._build_kwargs(prompt)
+    assert kwargs["prompt_cache_key"] == "shared-doc"
+    assert kwargs["extra_headers"] == {"session-id": "shared-doc"}
+
+
+def test_build_kwargs_prompt_cache_key_keeps_extra_headers():
+    model = CodexResponsesModel("gpt-5.4")
+    prompt = llm.Prompt(model=model, prompt="Hello")
+    prompt.options = model.Options(extra_headers={"X-Debug": "1"})
+    kwargs = model._build_kwargs(prompt, SimpleNamespace(id="01conversation"))
+    assert kwargs["extra_headers"] == {"X-Debug": "1", "session-id": "01conversation"}
+    assert model._build_kwargs(prompt)["extra_headers"] == {"X-Debug": "1"}
+
+
+def test_prompt_cache_key_accepts_printable_ascii():
+    options = CodexResponsesModel("gpt-5.4").Options(prompt_cache_key="big doc/v2")
+    assert options.prompt_cache_key == "big doc/v2"
+
+
+@pytest.mark.parametrize(
+    "value", ["", " ", " doc", "doc ", "doc-ü", "doc\r\nX-Other: 1", "doc\x00"]
+)
+def test_prompt_cache_key_rejects_invalid_header_values(value):
+    model = CodexResponsesModel("gpt-5.4")
+    with pytest.raises(ValidationError, match="prompt_cache_key"):
+        model.Options(prompt_cache_key=value)
+
+
+def test_cli_rejects_invalid_prompt_cache_key(fake_openai, monkeypatch):
+    from llm.cli import cli, get_model_options
+
+    monkeypatch.setattr("llm_openai_codex._model_names_for_registration", lambda: ["gpt-5.5"])
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["-m", "codex/gpt-5.5", "-o", "prompt_cache_key", "doc-ü", "Hello"]
+    )
+    assert result.exit_code != 0
+    assert "prompt_cache_key" in result.output
+    assert "printable ASCII" in result.output
+    assert fake_openai.calls == []
+    result = runner.invoke(
+        cli, ["models", "options", "set", "codex/gpt-5.5", "prompt_cache_key", "doc-ü"]
+    )
+    assert result.exit_code != 0
+    assert "prompt_cache_key" in result.output
+    assert get_model_options("codex/gpt-5.5") == {}
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_execute_sends_conversation_id_as_session_id(fake_openai, async_):
+    import asyncio
+
+    if async_:
+        conversation = AsyncCodexResponsesModel("gpt-5.4").conversation()
+
+        async def run():
+            await conversation.prompt("Hello").text()
+            await conversation.prompt("Again").text()
+
+        asyncio.run(run())
+    else:
+        conversation = CodexResponsesModel("gpt-5.4").conversation()
+        conversation.prompt("Hello").text()
+        conversation.prompt("Again").text()
+
+    calls = fake_openai.calls
+    assert [call["extra_headers"] for call in calls] == [
+        {"session-id": conversation.id}
+    ] * 2
+    assert [call["prompt_cache_key"] for call in calls] == [conversation.id] * 2
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_reply_sends_prompt_cache_key_only_when_passed(fake_openai, async_):
+    # Intentional, see _build_kwargs: reply() has no conversation and does
+    # not carry the earlier options.
+    import asyncio
+
+    if async_:
+
+        async def run():
+            conversation = AsyncCodexResponsesModel("gpt-5.4").conversation()
+            response = conversation.prompt("Hello", prompt_cache_key="doc")
+            await response.text()
+            reply = await response.reply("Again")
+            await reply.text()
+            reply = await reply.reply("More", options={"prompt_cache_key": "doc"})
+            await reply.text()
+
+        asyncio.run(run())
+    else:
+        conversation = CodexResponsesModel("gpt-5.4").conversation()
+        response = conversation.prompt("Hello", prompt_cache_key="doc")
+        response.text()
+        reply = response.reply("Again")
+        reply.text()
+        reply.reply("More", options={"prompt_cache_key": "doc"}).text()
+
+    calls = fake_openai.calls
+    assert [call.get("prompt_cache_key") for call in calls] == ["doc", None, "doc"]
+    assert [call.get("extra_headers") for call in calls] == [
+        {"session-id": "doc"},
+        None,
+        {"session-id": "doc"},
+    ]
+    assert calls[1]["input"][-1] == {"role": "user", "content": "Again"}
+
+
+def test_tool_chain_requests_share_prompt_cache_key(fake_openai):
+    fake_openai.streams = [
+        [
+            SimpleNamespace(
+                type="response.output_item.done",
+                item={
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": "{}",
+                },
+            )
+        ],
+        [SimpleNamespace(type="response.output_text.delta", delta="Done")],
+    ]
+
+    def lookup() -> str:
+        "Look something up."
+        return "found"
+
+    conversation = CodexResponsesModel("gpt-5.4").conversation()
+    assert conversation.chain("Find it", tools=[lookup]).text() == "Done"
+    calls = fake_openai.calls
+    assert [call["extra_headers"] for call in calls] == [
+        {"session-id": conversation.id}
+    ] * 2
+    assert calls[1]["input"][-1]["type"] == "function_call_output"
+
+
+def test_cli_continued_conversation_prompt_cache_key(fake_openai, monkeypatch):
+    from llm.cli import cli
+
+    monkeypatch.setattr("llm_openai_codex._model_names_for_registration", lambda: ["gpt-5.5"])
+    runner = CliRunner()
+    for args in (
+        ["-m", "codex/gpt-5.5", "Hello"],
+        ["-c", "Again"],
+        ["-c", "-o", "prompt_cache_key", "big-doc", "More"],
+        # llm -c does not keep the option of the earlier turn.
+        ["-c", "Last"],
+    ):
+        result = runner.invoke(cli, args)
+        assert result.exit_code == 0, result.output
+    result = runner.invoke(cli, ["logs", "list", "--json", "-n", "1"])
+    assert result.exit_code == 0, result.output
+    conversation_id = json.loads(result.output)[0]["conversation_id"]
+    keys = [conversation_id, conversation_id, "big-doc", conversation_id]
+    assert [call["prompt_cache_key"] for call in fake_openai.calls] == keys
+    assert [call["extra_headers"] for call in fake_openai.calls] == [
+        {"session-id": key} for key in keys
+    ]
+
+
+def test_cli_logs_cached_tokens_without_usage_attribution(fake_openai, monkeypatch):
+    from llm.cli import cli
+
+    monkeypatch.setattr("llm_openai_codex._model_names_for_registration", lambda: ["gpt-5.5"])
+    fake_openai.streams = [
+        [
+            SimpleNamespace(type="response.output_text.delta", delta="Hi"),
+            sdk_completed_event(
+                {**USAGE_WITH_CACHED_TOKENS, "attribution": USAGE_ATTRIBUTION},
+                prompt_cache_key="big-doc",
+            ),
+        ]
+    ]
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["-m", "codex/gpt-5.5", "-o", "prompt_cache_key", "big-doc", "Hello"]
+    )
+    assert result.exit_code == 0, result.output
+    result = runner.invoke(cli, ["logs", "list", "--json", "-n", "1"])
+    assert result.exit_code == 0, result.output
+    [row] = json.loads(result.output)
+    assert row["response_json"]["usage"] == USAGE_WITH_CACHED_TOKENS
+    assert row["response_json"]["prompt_cache_key"] == "big-doc"
+    assert row["options_json"] == {"prompt_cache_key": "big-doc"}
+    assert json.loads(row["token_details"]) == {
+        "input_tokens_details": {"cached_tokens": 4864}
+    }
+
+
+@pytest.mark.parametrize("model_class", [CodexResponsesModel, AsyncCodexResponsesModel])
 @pytest.mark.parametrize(
     "tier,expected",
     [
@@ -259,7 +560,7 @@ def test_service_tier_rejects_invalid_values(tier):
         model.Options(service_tier=tier)
 
 
-def test_service_tier_cli_defaults(monkeypatch):
+def test_service_tier_cli_defaults(fake_openai, monkeypatch):
     from llm.cli import cli, get_model_options, render_model_with_options
 
     monkeypatch.setattr("llm_openai_codex._model_names_for_registration", lambda: ["gpt-5.5"])
@@ -272,19 +573,15 @@ def test_service_tier_cli_defaults(monkeypatch):
     assert result.exit_code == 0, result.output
     saved = get_model_options(model.model_id)
     assert saved == {"service_tier": "fast"}
-    monkeypatch.setattr("llm_openai_codex.get_codex_key", lambda: ("tok", "acct"))
-    with patch("llm_openai_codex.openai.OpenAI") as client:
-        create = client.return_value.responses.create
-        create.side_effect = lambda **kwargs: iter([])
-        result = runner.invoke(cli, ["-m", model.model_id, "--no-log", "Hello"])
-        assert result.exit_code == 0, result.output
-        assert create.call_args.kwargs["service_tier"] == "priority"
-        result = runner.invoke(
-            cli,
-            ["-m", model.model_id, "--no-log", "-o", "service_tier", "default", "Hello"],
-        )
-        assert result.exit_code == 0, result.output
-        assert create.call_args.kwargs["service_tier"] == "default"
+    result = runner.invoke(cli, ["-m", model.model_id, "--no-log", "Hello"])
+    assert result.exit_code == 0, result.output
+    assert fake_openai.calls[-1]["service_tier"] == "priority"
+    result = runner.invoke(
+        cli,
+        ["-m", model.model_id, "--no-log", "-o", "service_tier", "default", "Hello"],
+    )
+    assert result.exit_code == 0, result.output
+    assert fake_openai.calls[-1]["service_tier"] == "default"
     assert get_model_options(model.model_id) == saved
 
     result = runner.invoke(
@@ -304,11 +601,10 @@ def test_service_tier_cli_defaults(monkeypatch):
 @pytest.mark.parametrize("async_", [False, True])
 @pytest.mark.parametrize("reject", [False, True])
 @pytest.mark.parametrize("model_name", ["gpt-5.5", "gpt-6-astra"])
-def test_execute_service_tier(monkeypatch, async_, reject, model_name):
+def test_execute_service_tier(fake_openai, async_, reject, model_name):
     import asyncio
     import openai
 
-    calls = []
     error_message = "The requested service tier is not available for this model"
     error = openai.BadRequestError(
         error_message,
@@ -319,36 +615,8 @@ def test_execute_service_tier(monkeypatch, async_, reject, model_name):
         ),
         body={"error": {"message": error_message, "param": "service_tier"}},
     )
-
-    def record(kwargs):
-        calls.append(kwargs)
-        if reject:
-            raise error
-
-    class FakeClient:
-        def __init__(self, **kwargs):
-            self.responses = self
-
-        def create(self, **kwargs):
-            record(kwargs)
-            return iter([])
-
-    class FakeAsyncClient:
-        def __init__(self, **kwargs):
-            self.responses = self
-
-        async def create(self, **kwargs):
-            record(kwargs)
-
-            async def events():
-                if False:
-                    yield None
-
-            return events()
-
-    monkeypatch.setattr("llm_openai_codex.openai.OpenAI", FakeClient)
-    monkeypatch.setattr("llm_openai_codex.openai.AsyncOpenAI", FakeAsyncClient)
-    monkeypatch.setattr("llm_openai_codex.get_codex_key", lambda: ("tok", "acct"))
+    if reject:
+        fake_openai.error = error
 
     def run():
         if async_:
@@ -367,9 +635,9 @@ def test_execute_service_tier(monkeypatch, async_, reject, model_name):
         assert exc.value is error
     else:
         run()
-    assert len(calls) == 1
-    assert calls[0]["model"] == model_name
-    assert calls[0]["service_tier"] == "priority"
+    [call] = fake_openai.calls
+    assert call["model"] == model_name
+    assert call["service_tier"] == "priority"
 
 
 def test_build_kwargs_web_search():
@@ -901,7 +1169,6 @@ def test_handle_event_completed_refreshes_web_search_events():
     completed = SimpleNamespace(
         type="response.completed",
         response=SimpleNamespace(
-            usage=None,
             model_dump=lambda: {
                 "status": "completed",
                 "output": [
@@ -947,7 +1214,6 @@ def test_handle_event_completed_with_empty_output_leaves_web_search_events():
     completed = SimpleNamespace(
         type="response.completed",
         response=SimpleNamespace(
-            usage=None,
             model_dump=lambda: {"status": "completed", "output": []},
         ),
     )
@@ -961,17 +1227,36 @@ def test_handle_event_completed_with_empty_output_leaves_web_search_events():
 
 def test_handle_event_completed_sets_response_json_and_usage():
     model = CodexResponsesModel("gpt-5.4")
+    usage = {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}
     event = SimpleNamespace(
         type="response.completed",
         response=SimpleNamespace(
-            usage={"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
-            model_dump=lambda: {"status": "completed"},
+            model_dump=lambda: {"status": "completed", "usage": dict(usage)},
         ),
     )
     response = RecordingResponse()
     assert model._handle_event(event, response, model._new_stream_state()) == []
-    assert response.response_json == {"status": "completed"}
+    # set_usage must not remove the token counts from the logged usage.
+    assert response.response_json == {"status": "completed", "usage": usage}
     assert response.usage == (7, 3, {})
+
+
+def test_handle_event_completed_drops_usage_attribution_from_sdk_event():
+    # The SDK models keep unknown fields, so model_dump() returns the
+    # backend's attribution tree unless the plugin removes it.
+    model = CodexResponsesModel("gpt-5.4")
+    event = sdk_completed_event(
+        {**USAGE_WITH_CACHED_TOKENS, "attribution": USAGE_ATTRIBUTION}
+    )
+    assert "attribution" in event.response.usage.model_dump()
+    response = RecordingResponse()
+    assert model._handle_event(event, response, model._new_stream_state()) == []
+    assert response.response_json["usage"] == USAGE_WITH_CACHED_TOKENS
+    assert response.usage == (
+        5471,
+        5,
+        {"input_tokens_details": {"cached_tokens": 4864}},
+    )
 
 
 def test_handle_event_completed_reemits_reasoning_metadata_from_final_payload():
@@ -988,7 +1273,6 @@ def test_handle_event_completed_reemits_reasoning_metadata_from_final_payload():
     completed = SimpleNamespace(
         type="response.completed",
         response=SimpleNamespace(
-            usage=None,
             model_dump=lambda: {
                 "status": "completed",
                 "output": [
@@ -1005,10 +1289,10 @@ def test_handle_event_completed_reemits_reasoning_metadata_from_final_payload():
     }
 
 
-def test_execute_assembles_reasoning_and_text_parts(monkeypatch):
+def test_execute_assembles_reasoning_and_text_parts(fake_openai):
     """End-to-end through LLM 0.32+'s Response machinery with a fake stream."""
     model = CodexResponsesModel("gpt-5.4")
-    stream = [
+    fake_openai.streams = [[
         SimpleNamespace(
             type="response.reasoning_summary_text.delta",
             delta="Thinking",
@@ -1022,7 +1306,6 @@ def test_execute_assembles_reasoning_and_text_parts(monkeypatch):
         SimpleNamespace(
             type="response.completed",
             response=SimpleNamespace(
-                usage={"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
                 model_dump=lambda: {
                     "status": "completed",
                     "output": [
@@ -1032,17 +1315,11 @@ def test_execute_assembles_reasoning_and_text_parts(monkeypatch):
                             "encrypted_content": "blob-b",
                         }
                     ],
+                    "usage": {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
                 },
             ),
         ),
-    ]
-
-    class FakeClient:
-        def __init__(self, **kwargs):
-            self.responses = SimpleNamespace(create=lambda **kw: iter(stream))
-
-    monkeypatch.setattr("llm_openai_codex.openai.OpenAI", FakeClient)
-    monkeypatch.setattr("llm_openai_codex.get_codex_key", lambda: ("tok", "acct"))
+    ]]
 
     response = model.prompt("Hi")
     assert response.text() == "Hello!"
@@ -1064,49 +1341,20 @@ def test_execute_assembles_reasoning_and_text_parts(monkeypatch):
     )
 
 
-def test_execute_passes_reasoning_summary_option(monkeypatch):
+def test_execute_passes_reasoning_summary_option(fake_openai):
     model = CodexResponsesModel("gpt-5.4")
-    recorded_kwargs = {}
-
-    class FakeClient:
-        def __init__(self, **kwargs):
-            def fake_create(**kw):
-                recorded_kwargs.update(kw)
-                return iter([])
-
-            self.responses = SimpleNamespace(create=fake_create)
-
-    monkeypatch.setattr("llm_openai_codex.openai.OpenAI", FakeClient)
-    monkeypatch.setattr("llm_openai_codex.get_codex_key", lambda: ("tok", "acct"))
-
     response = model.prompt("Hi", options={"reasoning_summary": "concise"})
     list(response)
 
-    assert "reasoning_summary" not in recorded_kwargs
-    assert recorded_kwargs["reasoning"] == {"summary": "concise"}
+    [kwargs] = fake_openai.calls
+    assert "reasoning_summary" not in kwargs
+    assert kwargs["reasoning"] == {"summary": "concise"}
 
 
-def test_execute_async_passes_reasoning_summary_option(monkeypatch):
+def test_execute_async_passes_reasoning_summary_option(fake_openai):
     import asyncio
 
     model = AsyncCodexResponsesModel("gpt-5.4")
-    recorded_kwargs = {}
-
-    class FakeAsyncClient:
-        def __init__(self, **kwargs):
-            async def fake_create(**kw):
-                recorded_kwargs.update(kw)
-
-                async def async_iter():
-                    if False:
-                        yield None
-
-                return async_iter()
-
-            self.responses = SimpleNamespace(create=fake_create)
-
-    monkeypatch.setattr("llm_openai_codex.openai.AsyncOpenAI", FakeAsyncClient)
-    monkeypatch.setattr("llm_openai_codex.get_codex_key", lambda: ("tok", "acct"))
 
     async def run():
         response = model.prompt("Hi", options={"reasoning_summary": "detailed"})
@@ -1114,8 +1362,9 @@ def test_execute_async_passes_reasoning_summary_option(monkeypatch):
 
     asyncio.run(run())
 
-    assert "reasoning_summary" not in recorded_kwargs
-    assert recorded_kwargs["reasoning"] == {"summary": "detailed"}
+    [kwargs] = fake_openai.calls
+    assert "reasoning_summary" not in kwargs
+    assert kwargs["reasoning"] == {"summary": "detailed"}
 
 
 def test_set_usage_tolerates_missing_token_fields():
@@ -1136,7 +1385,6 @@ def test_handle_event_failed_raises_model_error():
     event = SimpleNamespace(
         type="response.failed",
         response=SimpleNamespace(
-            usage=None,
             error=SimpleNamespace(message="quota exceeded"),
             model_dump=lambda: {"status": "failed"},
         ),
@@ -1152,13 +1400,18 @@ def test_handle_event_incomplete_records_response_and_usage():
     event = SimpleNamespace(
         type="response.incomplete",
         response=SimpleNamespace(
-            usage={"input_tokens": 1, "output_tokens": 2},
-            model_dump=lambda: {"status": "incomplete"},
+            model_dump=lambda: {
+                "status": "incomplete",
+                "usage": {"input_tokens": 1, "output_tokens": 2},
+            },
         ),
     )
     response = RecordingResponse()
     assert model._handle_event(event, response, model._new_stream_state()) == []
-    assert response.response_json == {"status": "incomplete"}
+    assert response.response_json == {
+        "status": "incomplete",
+        "usage": {"input_tokens": 1, "output_tokens": 2},
+    }
     assert response.usage == (1, 2, {})
 
 

@@ -20,6 +20,8 @@ LLM plugin for accessing ChatGPT/Codex-backed OpenAI models through the Response
   between turns.
 - Tool call names stream as soon as the model starts a call, before the
   arguments finish generating.
+- Sends a stable prompt cache key, so continued conversations and tool call
+  chains reuse cached input tokens.
 
 ## Installation
 
@@ -162,6 +164,60 @@ Requests run stateless (`store: false`), so the plugin asks the API for
 encrypted reasoning items and echoes them back on later turns. The model keeps
 its chain of thought across tool calls and continued conversations
 (`llm -c`, `llm chat -c`).
+
+## Prompt caching
+
+The Codex backend reuses the cached prefix of an earlier prompt only for
+requests with the same cache key. It takes the key from the `session-id`
+request header; without that header it gives each request a random key, and
+no request gets cached input tokens. The plugin sends the key as the
+`session-id` header and as `prompt_cache_key`:
+
+- By default, the key is the LLM conversation ID. Continued conversations
+  (`llm -c`, `llm chat`) and tool call chains reuse the cache of their earlier
+  requests.
+- `-o prompt_cache_key NAME` sets the key. The key is a header value, so it
+  must be printable ASCII text without leading or trailing spaces. Use the
+  same name to share the cache between separate conversations, for example
+  for questions about one long fragment:
+
+```bash
+llm -m codex/gpt-5.6-luna -o prompt_cache_key big-doc -f big-doc.md "First question"
+llm -m codex/gpt-5.6-luna -o prompt_cache_key big-doc -f big-doc.md "Second question"
+```
+
+LLM does not keep options between prompts. A continued prompt (`llm -c`)
+without the option sends the conversation ID as the key, and it does not use
+the prefix cached under `NAME`. Repeat the option on each continued prompt:
+
+```bash
+llm -c -o prompt_cache_key big-doc "Follow-up question"
+```
+
+`llm chat -o prompt_cache_key NAME` applies the key to each prompt of that
+chat session.
+
+In Python, `model.prompt()`, `Response.reply()`, and
+`model.prompt(messages=...)` have no conversation and do not repeat the
+options of earlier prompts. Without the `prompt_cache_key` option, the plugin
+sends no key for them, and they get no cached input tokens. Pass the option
+on each such prompt, or use `conversation.prompt()`:
+
+```python
+response = model.prompt("First question", prompt_cache_key="big-doc")
+reply = response.reply("Second question", options={"prompt_cache_key": "big-doc"})
+```
+
+This behavior can change in a later release, for example to a key derived
+from the stable start of the request.
+
+Cached input tokens show in the token usage (`-u`) and in `llm logs --json`
+as `token_details` `{"input_tokens_details": {"cached_tokens": N}}`. In
+`llm logs --json`, `options_json` shows a `prompt_cache_key` option, and
+`response_json` shows the key that the backend used as `prompt_cache_key`.
+The plugin removes the per-item `attribution` breakdown of the usage from
+`response_json` and from the token details. Caching is best effort: a request
+with a matching prefix can still miss the cache.
 
 ## Web search
 

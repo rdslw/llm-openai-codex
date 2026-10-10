@@ -38,7 +38,7 @@ from llm.parts import (
 )
 from llm.utils import simplify_usage_dict
 import openai
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, field_validator
 
 
 # --- Plugin-owned Codex auth ---
@@ -47,6 +47,7 @@ REFRESH_URL = "https://auth.openai.com/oauth/token"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 REFRESH_SKEW_SECONDS = 30
 CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
+SESSION_ID_HEADER = "session-id"
 CHATGPT_BACKEND_BASE_URL = "https://chatgpt.com/backend-api"
 LOGIN_COMMAND_HELP = "`llm codex login [--device-code]`"
 AUTH_RECOVERY_MESSAGE = f"Run {LOGIN_COMMAND_HELP} or `llm codex import`."
@@ -1024,6 +1025,29 @@ class CodexOptions(Options):
         description="web_search context size: low, medium, or high.",
         default=None,
     )
+    prompt_cache_key: Optional[str] = Field(
+        description=(
+            "Prompt cache key (printable ASCII), sent as the session-id "
+            "header. Defaults to the LLM conversation ID. Use the same value "
+            "on separate prompts to share a cached prefix between "
+            "conversations. llm -c does not keep it; repeat it on each "
+            "continued prompt."
+        ),
+        default=None,
+    )
+
+    @field_validator("prompt_cache_key")
+    @classmethod
+    def _validate_prompt_cache_key(cls, value):
+        # The key is an HTTP header value: the HTTP client cannot encode
+        # non-ASCII text, and control characters (CR/LF) break the request.
+        if value is not None and not (
+            value and value == value.strip() and value.isascii() and value.isprintable()
+        ):
+            raise ValueError(
+                "must be printable ASCII text without leading or trailing spaces"
+            )
+        return value
 
 
 class _SharedCodexResponses:
@@ -1067,8 +1091,8 @@ class _SharedCodexResponses:
     def set_usage(self, response, usage):
         if not usage:
             return
-        if not isinstance(usage, dict):
-            usage = usage.model_dump()
+        # Shallow copy: the caller's dict is part of response_json.
+        usage = dict(usage)
         input_tokens = usage.pop("input_tokens", None)
         output_tokens = usage.pop("output_tokens", None)
         usage.pop("total_tokens", None)
@@ -1170,7 +1194,7 @@ class _SharedCodexResponses:
                 items.extend(tool_call_items)
         return items, instructions
 
-    def _build_kwargs(self, prompt):
+    def _build_kwargs(self, prompt, conversation=None):
         input_items, instructions = self._build_input(prompt)
         kwargs = {
             "model": self.model_name,
@@ -1273,6 +1297,28 @@ class _SharedCodexResponses:
         for key, value in extras.items():
             if value is not None and key not in kwargs:
                 kwargs[key] = value
+
+        # The Codex backend takes the prompt cache key from the session-id
+        # header (it echoes the header value as prompt_cache_key); without the
+        # header it assigns a random key per request, so no request reuses
+        # the cached prefix of an earlier one. Codex CLI sends its thread ID
+        # as header and body field; the LLM conversation ID takes that role.
+        # Response.reply() and model.prompt(messages=...) have no conversation
+        # and do not carry the earlier options, so they send no key unless
+        # the caller passes prompt_cache_key. This is intentional for now; a
+        # key derived from a hash of the stable request prefix would give
+        # them cache hits too, if that becomes necessary.
+        cache_key = getattr(prompt.options, "prompt_cache_key", None) or getattr(
+            conversation, "id", None
+        )
+        if cache_key:
+            kwargs["prompt_cache_key"] = cache_key
+            # Merge, so that an extra_headers extra option is kept.
+            kwargs["extra_headers"] = {
+                **(kwargs.get("extra_headers") or {}),
+                SESSION_ID_HEADER: cache_key,
+            }
+
         # Server-side tool hooks run last, on the complete baseline request,
         # in list order (e.g. WebSearch appends its include entries).
         for tool in server_side_tools:
@@ -1361,8 +1407,15 @@ class _SharedCodexResponses:
             return self._output_item_done_events(data, response, state)
 
         if et in ("response.completed", "response.incomplete", "response.failed"):
-            response.response_json = event.response.model_dump()
-            self.set_usage(response, event.response.usage)
+            response_json = event.response.model_dump()
+            usage = response_json.get("usage")
+            if usage:
+                # Per-item token breakdown keyed by item IDs; it grows with
+                # the conversation and repeats the totals kept in
+                # input_tokens_details. Neither the log nor the usage keeps it.
+                usage.pop("attribution", None)
+            response.response_json = response_json
+            self.set_usage(response, usage)
             if et == "response.failed":
                 error = getattr(event.response, "error", None)
                 message = getattr(error, "message", None) or "Codex response failed."
@@ -1559,7 +1612,7 @@ class _SharedCodexResponses:
 class CodexResponsesModel(_SharedCodexResponses, Model):
     def execute(self, prompt, stream, response, conversation):
         client = openai.OpenAI(**self._get_client_kwargs())
-        kwargs = self._build_kwargs(prompt)
+        kwargs = self._build_kwargs(prompt, conversation)
         state = self._new_stream_state()
         for event in client.responses.create(**kwargs):
             yield from self._handle_event(event, response, state)
@@ -1568,7 +1621,7 @@ class CodexResponsesModel(_SharedCodexResponses, Model):
 class AsyncCodexResponsesModel(_SharedCodexResponses, AsyncModel):
     async def execute(self, prompt, stream, response, conversation):
         client = openai.AsyncOpenAI(**self._get_client_kwargs())
-        kwargs = self._build_kwargs(prompt)
+        kwargs = self._build_kwargs(prompt, conversation)
         state = self._new_stream_state()
         async for event in await client.responses.create(**kwargs):
             for stream_event in self._handle_event(event, response, state):
