@@ -269,10 +269,14 @@ uv run llm codex status
 ## Releasing
 
 1. Finish and verify the feature/fix commits.
-2. Bump `pyproject.toml` and commit it separately:
+2. Test with the newest dependency versions that `pyproject.toml` allows:
+   `uv lock --upgrade && uv run pytest`. `uv.lock` is not committed, so CI
+   resolves the dependencies again on each run; a local `uv.lock` keeps its
+   versions until `--upgrade`.
+3. Bump `pyproject.toml` and commit it separately:
    `git add pyproject.toml && git commit -m "bump: v0.5.0"`.
-3. Tag and push: `git tag v0.5.0 && git push origin main v0.5.0`.
-4. Create the release: `gh release create v0.5.0 --generate-notes`.
+4. Tag and push: `git tag v0.5.0 && git push origin main v0.5.0`.
+5. Create the release: `gh release create v0.5.0 --generate-notes`.
 
 The whole flow is version commit, tag, push, then GitHub Release. The release
 triggers testing and PyPI publication.

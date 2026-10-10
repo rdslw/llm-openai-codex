@@ -11,7 +11,10 @@
 ## Development
 
 - Use `uv` for the development environment.
-- Run the full suite with `uv run pytest` after code changes.
+- Run the full suite with `uv run pytest` after code changes. Do not run
+  `.venv/bin/python -m pytest` instead: it skips the sync of the environment
+  with `pyproject.toml`. If the uv cache is not writable (sandbox), set
+  `UV_CACHE_DIR` to a writable temporary directory.
 - Add or update tests for behavior changes, including error and fallback paths.
 - Keep synchronous and asynchronous model behavior aligned through the shared
   implementation.
@@ -73,6 +76,9 @@
 ## Releasing
 
 - Finish and verify feature/fix commits before changing the version.
+- Before the version bump, run `uv lock --upgrade && uv run pytest`, so local
+  tests use the newest dependency versions that `pyproject.toml` allows, as CI
+  does. `uv.lock` stays untracked.
 - Complete the whole flow: separate `bump: vX.Y.Z` commit changing
   `pyproject.toml`, tag that commit, push the branch and tag, then run
   `gh release create vX.Y.Z --generate-notes` to trigger PyPI publication.
