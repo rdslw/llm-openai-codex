@@ -1,4 +1,5 @@
 import base64
+import importlib.metadata
 import json
 import subprocess
 import time
@@ -9,6 +10,7 @@ from unittest.mock import patch
 
 from click.testing import CliRunner
 import llm
+import openai
 from llm.default_plugins.openai_models import WebSearch
 from llm.parts import (
     AttachmentPart,
@@ -33,6 +35,7 @@ from llm_openai_codex import (
     DEVICE_USER_CODE_URL,
     CHATGPT_BACKEND_BASE_URL,
     MODELS_CACHE_TTL,
+    PLUGIN_NAME,
     _account_id_from_token,
     _account_info_from_tokens,
     _auth_path,
@@ -45,6 +48,7 @@ from llm_openai_codex import (
     _fetch_codex_models,
     _import_codex_auth,
     _model_names_for_registration,
+    _plugin_version,
     _models_cache_path,
     _fetch_usage,
     _format_usage,
@@ -1952,6 +1956,50 @@ def test_refresh_persists_updates(auth_file):
     assert saved["tokens"]["refresh_token"] == "new_refresh"
     assert saved["tokens"]["account_id"] == "acct_refreshed"
     assert saved["last_refresh"]
+
+
+VERSION_LINE = (
+    f"llm-openai-codex RSkel v{importlib.metadata.version('llm-openai-codex')} "
+    "-- OpenAI via a Codex subscription, "
+    "https://github.com/rdslw/llm-openai-codex"
+)
+
+
+def test_codex_version_option():
+    result = CliRunner().invoke(codex, ["--version"])
+    assert result.exit_code == 0
+    assert result.output == VERSION_LINE + "\n"
+
+
+def test_status_starts_with_version_line(auth_file):
+    result = CliRunner().invoke(codex, ["status"])
+    assert result.exit_code == 0
+    assert result.output.splitlines()[0] == VERSION_LINE
+
+
+def test_plugin_version_falls_back_when_not_installed(monkeypatch):
+    def missing(name):
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr("llm_openai_codex.importlib.metadata.version", missing)
+    assert _plugin_version() == "unknown"
+
+
+@pytest.mark.parametrize(
+    "model_class,client_class",
+    [
+        (CodexResponsesModel, openai.OpenAI),
+        (AsyncCodexResponsesModel, openai.AsyncOpenAI),
+    ],
+)
+def test_sdk_user_agent_appends_plugin_token(monkeypatch, model_class, client_class):
+    monkeypatch.setattr("llm_openai_codex.get_codex_key", lambda: ("tok", "acct"))
+    client = client_class(**model_class("gpt-5.4")._get_client_kwargs(client_class))
+    sdk_default = client_class(api_key="x").user_agent
+    assert client.default_headers["User-Agent"] == (
+        f"{sdk_default} {PLUGIN_NAME}/{_plugin_version()}"
+    )
+    assert client.default_headers["ChatGPT-Account-ID"] == "acct"
 
 
 def test_status_missing_auth_exits_cleanly(auth_file):

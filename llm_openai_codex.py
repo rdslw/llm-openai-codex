@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import importlib.metadata
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import math
@@ -39,6 +40,26 @@ from llm.parts import (
 from llm.utils import simplify_usage_dict
 import openai
 from pydantic import ConfigDict, Field, field_validator
+
+
+PLUGIN_NAME = "llm-openai-codex"
+# %-style template for click.version_option and `llm codex status`.
+VERSION_MESSAGE = (
+    "%(package)s RSkel v%(version)s -- OpenAI via a Codex "
+    "subscription, https://github.com/rdslw/llm-openai-codex"
+)
+
+
+def _plugin_version():
+    # The version comes from pyproject.toml, through the installed metadata.
+    try:
+        return importlib.metadata.version(PLUGIN_NAME)
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
+def _version_line():
+    return VERSION_MESSAGE % {"package": PLUGIN_NAME, "version": _plugin_version()}
 
 
 # --- Plugin-owned Codex auth ---
@@ -481,6 +502,8 @@ def _post_json_status(url, payload):
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
+        # TODO: decide what User-Agent to send in urllib requests (auth, models,
+        # usage). Empty suppresses the Python-urllib default that Cloudflare blocks.
         headers={
             "Accept": "application/json",
             "Content-Type": "application/json",
@@ -688,6 +711,8 @@ def _fetch_codex_models():
     headers = {"Authorization": f"Bearer {token}"}
     if account_id:
         headers["ChatGPT-Account-ID"] = account_id
+    # TODO: decide what User-Agent to send in urllib requests (auth, models,
+    # usage). Empty suppresses the Python-urllib default that Cloudflare blocks.
     headers["User-Agent"] = ""
 
     req = urllib.request.Request(
@@ -762,6 +787,8 @@ def _request_json(url, headers):
 
 def _usage_headers():
     token, account_id = get_codex_key()
+    # TODO: decide what User-Agent to send in urllib requests (auth, models,
+    # usage). Empty suppresses the Python-urllib default that Cloudflare blocks.
     headers = {
         "Authorization": f"Bearer {token}",
         "User-Agent": "",
@@ -1077,9 +1104,14 @@ class _SharedCodexResponses:
         # plugin does not know about yet.
         return (WebSearch, llm.ServerSideTool)
 
-    def _get_client_kwargs(self):
+    def _get_client_kwargs(self, client_class):
         token, account_id = get_codex_key()
-        headers = {}
+        headers = {
+            "User-Agent": (
+                f"{client_class.__name__}/Python {openai.__version__} "
+                f"{PLUGIN_NAME}/{_plugin_version()}"
+            )
+        }
         if account_id:
             headers["ChatGPT-Account-ID"] = account_id
         return {
@@ -1611,7 +1643,7 @@ class _SharedCodexResponses:
 
 class CodexResponsesModel(_SharedCodexResponses, Model):
     def execute(self, prompt, stream, response, conversation):
-        client = openai.OpenAI(**self._get_client_kwargs())
+        client = openai.OpenAI(**self._get_client_kwargs(openai.OpenAI))
         kwargs = self._build_kwargs(prompt, conversation)
         state = self._new_stream_state()
         for event in client.responses.create(**kwargs):
@@ -1620,7 +1652,7 @@ class CodexResponsesModel(_SharedCodexResponses, Model):
 
 class AsyncCodexResponsesModel(_SharedCodexResponses, AsyncModel):
     async def execute(self, prompt, stream, response, conversation):
-        client = openai.AsyncOpenAI(**self._get_client_kwargs())
+        client = openai.AsyncOpenAI(**self._get_client_kwargs(openai.AsyncOpenAI))
         kwargs = self._build_kwargs(prompt, conversation)
         state = self._new_stream_state()
         async for event in await client.responses.create(**kwargs):
@@ -1680,6 +1712,7 @@ def _account_info_from_tokens(tokens):
 
 
 @click.group()
+@click.version_option(package_name=PLUGIN_NAME, message=VERSION_MESSAGE)
 def codex():
     "Manage llm-openai-codex authentication."
 
@@ -1720,6 +1753,7 @@ def logout():
 @codex.command()
 def status():
     "Show authentication status."
+    click.echo(_version_line())
     try:
         auth = _resolve_auth()
         _ensure_account_id(auth.data, persist_path=None if auth.read_only else auth.path)

@@ -79,7 +79,8 @@ llm codex login [--device-code]  # create plugin-owned auth with OAuth
 llm codex import                 # copy Codex CLI auth into plugin-owned auth
 llm codex import --path PATH     # copy an explicit local auth file
 llm codex import --path HOST:    # SCP HOST:~/.codex/auth.json as a snapshot
-llm codex status                 # show the active source and refreshability
+llm codex --version              # show the plugin version
+llm codex status                 # show the version, active source and refreshability
 llm codex refresh                # refresh the active source
 llm codex usage                  # show current Codex plan usage
 llm codex logout                 # delete local plugin-owned auth only
