@@ -2350,6 +2350,40 @@ def test_scp_import_safely_replaces_expired_non_refreshable_auth(auth_file):
     assert saved["tokens"]["access_token"] == new_token
 
 
+@pytest.mark.parametrize("new_hours,replaced", [(240, True), (1, False)])
+def test_scp_import_replaces_unexpired_snapshot_only_with_later_expiry(
+    auth_file, new_hours, replaced
+):
+    now = int(time.time())
+    new_token = jwt({"exp": now + new_hours * 3600})
+    _write_auth(
+        auth_file,
+        {
+            "auth_mode": "chatgpt",
+            "login_type": "scp",
+            "tokens": {"access_token": jwt({"exp": now + 3600})},
+        },
+    )
+    original = auth_file.read_bytes()
+
+    def fake_scp(args, check):
+        Path(args[-1]).write_text(
+            json.dumps({"auth_mode": "chatgpt", "tokens": {"access_token": new_token}})
+        )
+
+    with patch("llm_openai_codex.subprocess.run", side_effect=fake_scp):
+        result = CliRunner().invoke(codex, ["import", "--path", "example.com:"])
+
+    if replaced:
+        assert result.exit_code == 0, result.output
+        assert f"Replaced older SCP snapshot at {auth_file}" in result.output
+        assert json.loads(auth_file.read_text())["tokens"]["access_token"] == new_token
+    else:
+        assert result.exit_code != 0
+        assert "the downloaded snapshot does not expire later" in result.output
+        assert auth_file.read_bytes() == original
+
+
 @pytest.mark.parametrize(
     ("tokens", "reason"),
     (

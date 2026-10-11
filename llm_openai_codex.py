@@ -436,6 +436,7 @@ def _auth_file_state(auth_path):
 
 
 def _check_scp_replacement(auth_path):
+    "Return None for expired auth, else the expiry a newer SCP snapshot must beat."
     try:
         existing = _read_auth(auth_path)
     except BorrowKeyError:
@@ -450,8 +451,11 @@ def _check_scp_replacement(auth_path):
         raise _scp_replacement_error(
             auth_path, "its access-token expiry cannot be decoded"
         )
-    if time.time() < exp:
+    if time.time() >= exp:
+        return None
+    if not _is_scp_snapshot(existing):
         raise _scp_replacement_error(auth_path, "its access token has not expired")
+    return exp
 
 
 def _read_scp_auth(target):
@@ -484,10 +488,11 @@ def _import_codex_auth(path=None):
     auth_path = _auth_path()
     is_scp = path is not None and str(path).endswith(":")
     initial_auth_state = _auth_file_state(auth_path)
-    replacing_expired_snapshot = False
+    replaced = None
+    older_than = None
     if initial_auth_state is not None and is_scp:
-        _check_scp_replacement(auth_path)
-        replacing_expired_snapshot = True
+        older_than = _check_scp_replacement(auth_path)
+        replaced = "older SCP snapshot" if older_than else "expired non-refreshable auth"
     elif initial_auth_state is not None:
         raise BorrowKeyError(
             f"Plugin-owned auth already exists at {auth_path}. "
@@ -518,6 +523,10 @@ def _import_codex_auth(path=None):
     login_type = "scp" if is_scp else "import"
     if is_scp:
         tokens.pop("refresh_token", None)
+    if older_than is not None and (_jwt_exp(tokens["access_token"]) or 0) <= older_than:
+        raise _scp_replacement_error(
+            auth_path, "the downloaded snapshot does not expire later"
+        )
     plugin_data = _normalize_auth_data(tokens, login_type)
     if is_scp and _auth_file_state(auth_path) != initial_auth_state:
         raise BorrowKeyError(
@@ -529,8 +538,8 @@ def _import_codex_auth(path=None):
     if not is_scp:
         # No issued_at: an imported token can be old, only `iat` is reliable.
         _warn_if_short_lifetime(tokens["access_token"])
-    if replacing_expired_snapshot:
-        click.echo(f"Replaced expired non-refreshable auth at {auth_path}")
+    if replaced:
+        click.echo(f"Replaced {replaced} at {auth_path}")
     return auth_path, plugin_data
 
 

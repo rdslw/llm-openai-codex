@@ -58,8 +58,9 @@
 - SCP imports copy only the fixed remote `~/.codex/auth.json`, discard the
   refresh token, and remain non-refreshable snapshots. Never replace existing
   plugin auth unless it has no refresh token and its access-token JWT has a
-  decodable, expired expiry; perform that check before invoking `scp` and
-  preserve existing auth on every transfer or validation failure.
+  decodable expiry that has passed, or it is an SCP snapshot and the download
+  expires later; perform the check of the existing auth before invoking `scp`
+  and preserve existing auth on every transfer or validation failure.
 - Refresh rotates the refresh token. A borrowed refresh writes the shared Codex
   CLI auth file and must retain its user-facing warning.
 - Logout deletes local plugin-owned auth only; it does not revoke tokens or
