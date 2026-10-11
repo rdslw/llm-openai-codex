@@ -1,13 +1,16 @@
 name: Publish to PyPI
 
+# Pushing a lightweight tag vX.Y.Z (on the `bump: vX.Y.Z` commit) tests,
+# publishes to PyPI, then makes the GitHub release: no local `gh`, only git.
+# One workflow on purpose: a release made with the workflow token starts no
+# other workflow, so a separate `on: release` publisher would never run.
+# The PyPI trusted publisher is bound to this file name and environment `pypi`.
 on:
-  workflow_dispatch:
-  release:
-    types: [published]
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]  # vX.Y.Z only
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   test:
@@ -16,26 +19,25 @@ jobs:
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
 
+      # setup-uv publishes no major tags since v8: pin the full version.
       - name: Set up uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
 
       # --no-editable: install the built wheel instead of uv's default
       # editable install, so packaging bugs (file missing from the wheel)
       # surface here, before publish.
-      # OLD: pip install . --group dev
       - name: Install dependencies
         run: uv sync --all-groups --no-editable
 
-      # OLD: python -m pytest
       - name: Run tests
         run: uv run pytest
 
@@ -43,23 +45,55 @@ jobs:
     runs-on: ubuntu-latest
     needs: [test]
     environment: pypi
+    permissions:
+      id-token: write
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.x"
-
+      # No cache in the job that uploads to PyPI (cache poisoning).
       - name: Set up uv
-        uses: astral-sh/setup-uv@v6
-        with:
-          enable-cache: true
+        uses: astral-sh/setup-uv@v10.3.0
 
       # Same as: pip install build && python -m build — both drive the
       # backend from pyproject.toml to produce dist/*.whl + dist/*.tar.gz.
       - name: Build
         run: uv build
 
+      # The wheel name proves that the tag equals the pyproject.toml version.
+      - name: Check built version is the tag
+        run: |
+          ls "dist/llm_openai_codex-${GITHUB_REF_NAME#v}-py3-none-any.whl" \
+            || { echo "::error::pyproject.toml version is not ${GITHUB_REF_NAME#v}"; exit 1; }
+
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [publish]
+    permissions:
+      contents: write
+
+    steps:
+      # Full history and tags, to find the previous tag for the notes.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Notes: body of the tagged bump commit, subjects of the commits since
+      # the previous tag, compare link.
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          prev=$(git describe --tags --abbrev=0 "$tag^")
+          {
+            git log -1 --format=%b "$tag"
+            echo
+            git log --format='- %s' "$prev..$tag^"
+            echo
+            echo "**Full Changelog**: https://github.com/$GITHUB_REPOSITORY/compare/$prev...$tag"
+          } > notes.md
+          gh release create "$tag" --verify-tag --notes-file notes.md

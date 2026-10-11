@@ -274,10 +274,17 @@ uv run llm codex status
    `uv lock --upgrade && uv run pytest`. `uv.lock` is not committed, so CI
    resolves the dependencies again on each run; a local `uv.lock` keeps its
    versions until `--upgrade`.
-3. Bump `pyproject.toml` and commit it separately:
-   `git add pyproject.toml && git commit -m "bump: v0.5.0"`.
-4. Tag and push: `git tag v0.5.0 && git push origin main v0.5.0`.
-5. Create the release: `gh release create v0.5.0 --generate-notes`.
+3. Bump `pyproject.toml` and commit it separately. The commit body is the
+   start of the release notes:
+   `git add pyproject.toml && git commit -m "bump: v0.5.0" -m "<release info>"`.
+4. Tag (lightweight) and push: `git tag v0.5.0 && git push origin main v0.5.0`.
 
-The whole flow is version commit, tag, push, then GitHub Release. The release
-triggers testing and PyPI publication.
+The pushed `v*` tag starts `.github/workflows/publish.yml`: tests, a check that
+the tag is `vX.Y.Z` and equal to the `pyproject.toml` version, PyPI
+publication, then the GitHub release. No local `gh` is necessary. The release
+notes are the body of the bump commit, the subjects of the commits since the
+previous tag, and a compare link.
+
+If `publish.yml` fails before PyPI publication, remove the tag
+(`git push origin :refs/tags/v0.5.0 && git tag -d v0.5.0`), fix, tag and push
+again. If only the release job fails, re-run it in GitHub Actions.

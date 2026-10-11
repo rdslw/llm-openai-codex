@@ -13,8 +13,12 @@
 - Use `uv` for the development environment.
 - Run the full suite with `uv run pytest` after code changes. Do not run
   `.venv/bin/python -m pytest` instead: it skips the sync of the environment
-  with `pyproject.toml`. If the uv cache is not writable (sandbox), set
-  `UV_CACHE_DIR` to a writable temporary directory.
+  with `pyproject.toml`.
+- In a sandbox, the default uv cache (`~/.cache/uv`) is not writable. Prefix
+  each `uv` command with a cache in the sandbox temporary directory:
+  `UV_CACHE_DIR="$TMPDIR/uv-cache" UV_LINK_MODE=copy uv run pytest`.
+  `UV_LINK_MODE=copy` stops the hardlink warning (the cache and `.venv` are on
+  different file systems). The first run downloads the packages again.
 - Add or update tests for behavior changes, including error and fallback paths.
 - Keep synchronous and asynchronous model behavior aligned through the shared
   implementation.
@@ -80,5 +84,10 @@
   tests use the newest dependency versions that `pyproject.toml` allows, as CI
   does. `uv.lock` stays untracked.
 - Complete the whole flow: separate `bump: vX.Y.Z` commit changing
-  `pyproject.toml`, tag that commit, push the branch and tag, then run
-  `gh release create vX.Y.Z --generate-notes` to trigger PyPI publication.
+  `pyproject.toml` (its body starts the release notes), lightweight tag on that
+  commit, then `git push origin main vX.Y.Z`. The tag push starts
+  `publish.yml`, which tests, publishes to PyPI and creates the GitHub
+  release. Do not run `gh release create`.
+- Keep the PyPI publication and the release in `publish.yml`: a release made
+  with the workflow token starts no other workflow. Do not rename the file;
+  the PyPI trusted publisher is bound to it.
