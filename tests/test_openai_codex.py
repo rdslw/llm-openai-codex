@@ -60,6 +60,7 @@ from llm_openai_codex import (
     _resolve_auth,
     _write_auth,
     get_codex_key,
+    SHORT_LIFETIME_WARNING,
     codex,
     ReasoningSummaryEnum,
 )
@@ -1435,6 +1436,47 @@ def test_fetch_codex_models_returns_none_without_auth():
     assert models is None
 
 
+@pytest.mark.parametrize("seconds_left", [3600, -60])
+def test_fetch_codex_models_never_refreshes(auth_file, seconds_left):
+    access_token = jwt({"exp": int(time.time()) + seconds_left})
+    _write_auth(
+        auth_file,
+        {
+            "auth_mode": "chatgpt",
+            "tokens": {"access_token": access_token, "refresh_token": "refresh"},
+        },
+    )
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps({"models": []}).encode()
+
+    def fake_urlopen(req, timeout):
+        captured["authorization"] = req.get_header("Authorization")
+        return FakeResponse()
+
+    with patch("llm_openai_codex._refresh") as refresh:
+        with patch("llm_openai_codex.urllib.request.urlopen", fake_urlopen):
+            models = _fetch_codex_models()
+
+    refresh.assert_not_called()
+    if seconds_left > 0:
+        # Inside the refresh window but not expired: used without a refresh.
+        assert models == []
+        assert captured["authorization"] == f"Bearer {access_token}"
+    else:
+        assert models is None
+        assert captured == {}
+    assert json.loads(auth_file.read_text())["tokens"]["access_token"] == access_token
+
+
 def test_model_registration_falls_back_to_defaults():
     with patch("llm_openai_codex._fetch_codex_models", return_value=None):
         models = _model_names_for_registration()
@@ -1785,7 +1827,7 @@ def test_get_codex_key_uses_codex_cli_fallback_without_persisting(
 ):
     token = jwt(
         {
-            "exp": int(time.time()) + 3600,
+            "exp": int(time.time()) + 3 * 3600,
             "chatgpt_account_id": "acct_from_access",
         }
     )
@@ -1813,7 +1855,7 @@ def test_get_codex_key_auto_refreshes_codex_cli_fallback(
         },
     )
 
-    new_token = jwt({"exp": int(time.time()) + 3600, "chatgpt_account_id": "acct_new"})
+    new_token = jwt({"exp": int(time.time()) + 3 * 3600, "chatgpt_account_id": "acct_new"})
     with patch(
         "llm_openai_codex._refresh",
         return_value={"access_token": new_token, "refresh_token": "rotated"},
@@ -1946,7 +1988,7 @@ def test_refresh_persists_updates(auth_file):
     with patch(
         "llm_openai_codex._refresh",
         return_value={
-            "access_token": jwt({"exp": int(time.time()) + 3600}),
+            "access_token": jwt({"exp": int(time.time()) + 3 * 3600}),
             "id_token": jwt({"chatgpt_account_id": "acct_refreshed"}),
             "refresh_token": "new_refresh",
         },
@@ -2170,7 +2212,7 @@ def test_scp_import_uses_exact_arguments_and_stores_non_refreshable_snapshot(
 ):
     access_token = jwt(
         {
-            "exp": int(time.time()) + 3600,
+            "exp": int(time.time()) + 3 * 3600,
             "chatgpt_account_id": "acct_remote",
         }
     )
@@ -2281,7 +2323,7 @@ def test_scp_import_wrong_auth_mode_names_remote_source(auth_file):
 
 def test_scp_import_safely_replaces_expired_non_refreshable_auth(auth_file):
     old_token = jwt({"exp": int(time.time()) - 60})
-    new_token = jwt({"exp": int(time.time()) + 3600})
+    new_token = jwt({"exp": int(time.time()) + 3 * 3600})
     _write_auth(
         auth_file,
         {
@@ -2320,7 +2362,7 @@ def test_scp_import_safely_replaces_expired_non_refreshable_auth(auth_file):
         ),
         ({"access_token": "not-a-jwt"}, "expiry cannot be decoded"),
         (
-            {"access_token": jwt({"exp": int(time.time()) + 3600})},
+            {"access_token": jwt({"exp": int(time.time()) + 3 * 3600})},
             "has not expired",
         ),
     ),
@@ -2410,7 +2452,7 @@ def test_scp_import_preserves_auth_changed_during_transfer(
                 {
                     "auth_mode": "chatgpt",
                     "tokens": {
-                        "access_token": jwt({"exp": int(time.time()) + 3600})
+                        "access_token": jwt({"exp": int(time.time()) + 3 * 3600})
                     },
                 }
             )
@@ -2433,7 +2475,7 @@ def test_scp_snapshot_status_is_not_refreshable(auth_file):
             "auth_mode": "chatgpt",
             "login_type": "scp",
             "tokens": {
-                "access_token": jwt({"exp": int(time.time()) + 3600}),
+                "access_token": jwt({"exp": int(time.time()) + 3 * 3600}),
                 "refresh_token": "ignored-for-scp",
             },
         },
@@ -2452,15 +2494,116 @@ def test_local_import_status_is_refreshable(auth_file):
         {
             "auth_mode": "chatgpt",
             "login_type": "import",
-            "tokens": {"access_token": "access", "refresh_token": "refresh"},
+            "tokens": {
+                "access_token": jwt({"exp": int(time.time()) + 3 * 3600}),
+                "refresh_token": "refresh",
+            },
         },
     )
 
-    result = CliRunner().invoke(codex, ["status"])
+    with patch("llm_openai_codex._refresh") as refresh:
+        result = CliRunner().invoke(codex, ["status"])
+
+    refresh.assert_not_called()
 
     assert result.exit_code == 0
     assert "login_type: import" in result.output
     assert "refreshable: yes" in result.output
+
+
+def test_get_codex_key_refreshes_token_within_refresh_window(auth_file):
+    _write_auth(
+        auth_file,
+        {
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": jwt({"exp": int(time.time()) + 3600}),
+                "refresh_token": "refresh",
+            },
+        },
+    )
+    new_token = jwt({"exp": int(time.time()) + 10 * 24 * 3600})
+
+    with patch(
+        "llm_openai_codex._refresh",
+        return_value={"access_token": new_token, "refresh_token": "rotated"},
+    ) as refresh:
+        token, _ = get_codex_key()
+
+    refresh.assert_called_once_with("refresh")
+    assert token == new_token
+
+
+def test_status_refreshes_token_within_refresh_window(auth_file):
+    _write_auth(
+        auth_file,
+        {
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": jwt({"exp": int(time.time()) + 3600}),
+                "refresh_token": "refresh",
+            },
+        },
+    )
+    new_token = jwt({"exp": int(time.time()) + 10 * 24 * 3600})
+
+    with patch(
+        "llm_openai_codex._refresh",
+        return_value={"access_token": new_token, "refresh_token": "rotated"},
+    ) as refresh:
+        result = CliRunner().invoke(codex, ["status"])
+
+    assert result.exit_code == 0
+    refresh.assert_called_once_with("refresh")
+    assert f"Refreshed Codex auth at {auth_file}" in result.output
+    assert f"access_token: {new_token[:8]}...{new_token[-6:]}" in result.output
+    saved = json.loads(auth_file.read_text())
+    assert saved["tokens"]["access_token"] == new_token
+    assert saved["tokens"]["refresh_token"] == "rotated"
+
+
+def test_status_refresh_failure_still_shows_stored_auth(auth_file):
+    _write_auth(
+        auth_file,
+        {
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": jwt({"exp": int(time.time()) - 60}),
+                "refresh_token": "refresh",
+            },
+        },
+    )
+
+    with patch(
+        "llm_openai_codex._refresh",
+        side_effect=BorrowKeyError("Token refresh failed (HTTP 401): {}"),
+    ):
+        result = CliRunner().invoke(codex, ["status"])
+
+    assert result.exit_code == 0
+    assert "Auth source: plugin-owned auth" in result.output
+    assert "refreshable: yes" in result.output
+    assert "Refreshed Codex auth" not in result.output
+    assert result.output.rstrip().endswith("Token refresh failed (HTTP 401): {}")
+
+
+def test_status_reports_expired_scp_snapshot_without_refresh(auth_file):
+    _write_auth(
+        auth_file,
+        {
+            "auth_mode": "chatgpt",
+            "login_type": "scp",
+            "tokens": {"access_token": jwt({"exp": int(time.time()) - 60})},
+        },
+    )
+
+    with patch("llm_openai_codex._refresh") as refresh:
+        result = CliRunner().invoke(codex, ["status"])
+
+    assert result.exit_code == 0
+    refresh.assert_not_called()
+    assert "refreshable: no" in result.output
+    assert "llm codex import --path HOST:" in result.output
 
 
 def test_unexpired_scp_snapshot_is_used_without_refresh(auth_file):
@@ -2524,7 +2667,7 @@ def test_refresh_command_rejects_scp_snapshot(auth_file):
             "auth_mode": "chatgpt",
             "login_type": "scp",
             "tokens": {
-                "access_token": jwt({"exp": int(time.time()) + 3600}),
+                "access_token": jwt({"exp": int(time.time()) + 3 * 3600}),
                 "refresh_token": "must-not-be-used",
             },
         },
@@ -2744,3 +2887,178 @@ def test_refresh_and_exchange_use_json_post_helper():
         "code_verifier": "verifier",
         "redirect_uri": "http://localhost:1455/auth/callback",
     }
+
+
+HOUR = 3600
+
+
+def short_lifetime_text(hours):
+    return SHORT_LIFETIME_WARNING % hours
+
+
+@pytest.mark.parametrize(
+    "minutes_left,refreshes",
+    [(50, False), (20, True)],
+)
+def test_short_lived_token_refreshes_at_half_lifetime(
+    auth_file, minutes_left, refreshes
+):
+    now = int(time.time())
+    exp = now + minutes_left * 60
+    _write_auth(
+        auth_file,
+        {
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": jwt({"iat": exp - HOUR, "exp": exp}),
+                "refresh_token": "refresh",
+            },
+        },
+    )
+    new_token = jwt({"iat": now, "exp": now + 10 * 24 * HOUR})
+
+    with patch(
+        "llm_openai_codex._refresh",
+        return_value={"access_token": new_token, "refresh_token": "rotated"},
+    ) as refresh:
+        get_codex_key()
+
+    assert refresh.called is refreshes
+
+
+def test_status_shows_issued_lifetime_from_iat(auth_file):
+    now = int(time.time())
+    _write_auth(
+        auth_file,
+        {
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": jwt({"iat": now - 9 * 24 * HOUR, "exp": now + 24 * HOUR}),
+                "refresh_token": "refresh",
+            },
+        },
+    )
+
+    with patch("llm_openai_codex._refresh") as refresh:
+        result = CliRunner().invoke(codex, ["status"])
+
+    refresh.assert_not_called()
+    assert "access_token lifetime: 240.0 hours" in result.output
+
+
+def test_status_shows_unknown_lifetime(auth_file):
+    _write_auth(
+        auth_file,
+        {
+            "auth_mode": "chatgpt",
+            "login_type": "scp",
+            "tokens": {"access_token": jwt({"exp": int(time.time()) + HOUR})},
+        },
+    )
+
+    result = CliRunner().invoke(codex, ["status"])
+
+    assert "access_token lifetime: unknown" in result.output
+
+
+@pytest.mark.parametrize(
+    "new_payload,warns",
+    [
+        ({"exp_in": HOUR}, True),
+        ({"exp_in": 10 * 24 * HOUR}, False),
+        ({"exp_in": 5 * HOUR}, False),
+    ],
+)
+def test_refresh_warns_about_short_lifetime(auth_file, new_payload, warns):
+    _write_auth(
+        auth_file,
+        {
+            "auth_mode": "chatgpt",
+            "tokens": {"access_token": "old", "refresh_token": "refresh"},
+        },
+    )
+    now = int(time.time())
+    claims = {"exp": now + new_payload["exp_in"]}
+    if "iat_ago" in new_payload:
+        claims["iat"] = now - new_payload["iat_ago"]
+
+    with patch(
+        "llm_openai_codex._refresh",
+        return_value={"access_token": jwt(claims), "refresh_token": "rotated"},
+    ):
+        result = CliRunner().invoke(codex, ["refresh"])
+
+    assert result.exit_code == 0
+    assert (short_lifetime_text(1.0) in result.stderr) is warns
+    if not warns:
+        assert "lifetime" not in result.stderr
+
+
+@pytest.mark.parametrize("device_code", [False, True])
+def test_login_warns_about_short_lifetime(auth_file, device_code):
+    now = int(time.time())
+    tokens = {
+        "access_token": jwt({"iat": now, "exp": now + HOUR}),
+        "refresh_token": "refresh",
+    }
+    login_function = "_device_code_login" if device_code else "_browser_login"
+
+    with patch(f"llm_openai_codex.{login_function}", return_value=tokens):
+        result = CliRunner().invoke(
+            codex, ["login", "--device-code"] if device_code else ["login"]
+        )
+
+    # A warning, not an error: the tokens are saved and usable.
+    assert result.exit_code == 0
+    assert short_lifetime_text(1.0) in result.stderr
+    assert json.loads(auth_file.read_text())["tokens"] == tokens
+
+
+def test_login_without_short_lifetime_does_not_warn(auth_file):
+    now = int(time.time())
+    tokens = {
+        "access_token": jwt({"iat": now, "exp": now + 10 * 24 * HOUR}),
+        "refresh_token": "refresh",
+    }
+
+    with patch("llm_openai_codex._browser_login", return_value=tokens):
+        result = CliRunner().invoke(codex, ["login"])
+
+    assert result.exit_code == 0
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    "claims,warns",
+    [
+        # Issued with a short lifetime.
+        ({"iat_ago": 10 * 60, "exp_in": 50 * 60}, True),
+        # Issued long ago with a long lifetime: little time left is no warning.
+        ({"iat_ago": 10 * 24 * HOUR - 30 * 60, "exp_in": 30 * 60}, False),
+        # No iat: the issued lifetime is unknown, so no warning.
+        ({"exp_in": 30 * 60}, False),
+    ],
+)
+def test_local_import_warns_only_about_short_issued_lifetime(
+    auth_file, tmp_path, claims, warns
+):
+    now = int(time.time())
+    payload = {"exp": now + claims["exp_in"]}
+    if "iat_ago" in claims:
+        payload["iat"] = now - claims["iat_ago"]
+    source = tmp_path / "codex-auth.json"
+    source.write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {"access_token": jwt(payload), "refresh_token": "refresh"},
+            }
+        )
+    )
+
+    result = CliRunner().invoke(codex, ["import", "--path", str(source)])
+
+    assert result.exit_code == 0
+    assert (short_lifetime_text(1.0) in result.stderr) is warns
+    if not warns:
+        assert result.stderr == ""

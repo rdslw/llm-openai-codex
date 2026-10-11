@@ -66,7 +66,10 @@ def _version_line():
 
 REFRESH_URL = "https://auth.openai.com/oauth/token"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-REFRESH_SKEW_SECONDS = 30
+# Refresh when the access token expires within this window. Tokens that live
+# less than twice the window refresh at half their lifetime instead, so they
+# cannot cause a refresh on every call.
+REFRESH_SKEW_SECONDS = 2 * 60 * 60
 CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 SESSION_ID_HEADER = "session-id"
 CHATGPT_BACKEND_BASE_URL = "https://chatgpt.com/backend-api"
@@ -82,6 +85,11 @@ AUTH_MISSING_MESSAGE = (
 BORROWED_REFRESH_WARNING = (
     "Refreshed shared Codex CLI auth; its refresh token was rotated. "
     "Restart any running Codex CLI session."
+)
+SHORT_LIFETIME_WARNING = (
+    "Access token lifetime is %.1f hours, shorter than twice the "
+    f"{REFRESH_SKEW_SECONDS // 3600}-hour refresh window; "
+    "it refreshes at half its lifetime."
 )
 SCP_REIMPORT_HELP = "Repeat `llm codex import --path HOST:` to update it."
 REDIRECT_URI = "http://localhost:1455/auth/callback"
@@ -124,16 +132,16 @@ class AuthContext:
         )
 
 
-def get_codex_key():
+def get_codex_key(refresh=True):
     """
     Return (access_token, account_id) from ChatGPT OAuth credentials.
 
     Plugin-owned auth is preferred; Codex CLI auth is a borrowed fallback.
-    Refreshable credentials auto-refresh in place when the access token expires;
-    SCP snapshots are used unchanged until their access token expires.
+    Refreshable credentials auto-refresh in place near expiry; SCP snapshots,
+    and every source with refresh=False, are used unchanged until expiry.
     """
     auth = _resolve_auth()
-    tokens = _valid_auth_tokens(auth)
+    tokens = _valid_auth_tokens(auth, refresh=refresh)
     return tokens["access_token"], tokens.get("account_id")
 
 
@@ -173,7 +181,7 @@ def _resolve_auth():
     )
 
 
-def _valid_auth_tokens(auth):
+def _valid_auth_tokens(auth, refresh=True):
     tokens = auth.tokens
     if not tokens.get("access_token"):
         raise BorrowKeyError(auth.missing_access_token_message())
@@ -188,13 +196,18 @@ def _valid_auth_tokens(auth):
             "SCP-imported auth is a non-refreshable access-token snapshot and "
             f"has expired. {SCP_REIMPORT_HELP}"
         )
+    if not refresh:
+        if exp is None or time.time() < exp:
+            return tokens
+        raise BorrowKeyError(f"{auth.name} at {auth.path} has an expired access token.")
 
-    if exp is not None and time.time() < (exp - REFRESH_SKEW_SECONDS):
+    lifetime = _token_lifetime(tokens["access_token"])
+    skew = min(REFRESH_SKEW_SECONDS, lifetime / 2) if lifetime else REFRESH_SKEW_SECONDS
+    if exp is not None and time.time() < (exp - skew):
         return tokens
 
-    # Refresh in place for both sources; the expiry gate above means this fires
-    # only when the token is essentially dead, i.e. when Codex CLI would refresh
-    # anyway, so a borrowed rotation rarely collides with a live CLI session.
+    # Refresh in place for both sources. Near expiry only, so a borrowed
+    # rotation rarely collides with a live Codex CLI session.
     if auth.read_only:
         click.echo(BORROWED_REFRESH_WARNING, err=True)
     _refresh_auth(auth.data, auth.path)
@@ -257,17 +270,36 @@ def _jwt_payload(token):
         return None
 
 
-def _jwt_exp(token):
+def _jwt_time_claim(token, name):
     payload = _jwt_payload(token)
     if payload:
-        exp = payload.get("exp")
+        value = payload.get(name)
         if (
-            isinstance(exp, (int, float))
-            and not isinstance(exp, bool)
-            and math.isfinite(exp)
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
         ):
-            return exp
+            return value
     return None
+
+
+def _jwt_exp(token):
+    return _jwt_time_claim(token, "exp")
+
+
+def _token_lifetime(token, issued_at=None):
+    "Return exp minus iat (else issued_at) in seconds, or None if unknown."
+    exp = _jwt_exp(token)
+    issued_at = _jwt_time_claim(token, "iat") or issued_at
+    if exp is None or issued_at is None or exp <= issued_at:
+        return None
+    return exp - issued_at
+
+
+def _warn_if_short_lifetime(token, issued_at=None):
+    lifetime = _token_lifetime(token, issued_at)
+    if lifetime and lifetime < 2 * REFRESH_SKEW_SECONDS:
+        click.echo(SHORT_LIFETIME_WARNING % (lifetime / 3600), err=True)
 
 
 def _account_id_from_token(token):
@@ -376,6 +408,7 @@ def _refresh_auth(data, auth_path=None):
     _ensure_account_id(data)
     if auth_path is not None:
         _write_auth(auth_path, data)
+    _warn_if_short_lifetime(tokens.get("access_token"), issued_at=time.time())
     return data
 
 
@@ -493,6 +526,9 @@ def _import_codex_auth(path=None):
             "auth with `llm codex status` before trying again."
         )
     _write_auth(auth_path, plugin_data)
+    if not is_scp:
+        # No issued_at: an imported token can be old, only `iat` is reliable.
+        _warn_if_short_lifetime(tokens["access_token"])
     if replacing_expired_snapshot:
         click.echo(f"Replaced expired non-refreshable auth at {auth_path}")
     return auth_path, plugin_data
@@ -702,9 +738,11 @@ def _fetch_codex_models():
     """
     Fetch the list of available models from the Codex endpoint.
     Returns a list of model slug strings, or None when auth or the fetch fails.
+    Never refreshes: discovery runs in every llm process that loads models,
+    and a refresh there would rotate the refresh token as a hidden side effect.
     """
     try:
-        token, account_id = get_codex_key()
+        token, account_id = get_codex_key(refresh=False)
     except BorrowKeyError:
         return None
 
@@ -1730,6 +1768,7 @@ def login(device_code):
     except BorrowKeyError as e:
         raise click.ClickException(str(e)) from None
     click.echo(f"Saved llm-openai-codex auth to {auth_path}")
+    _warn_if_short_lifetime(tokens.get("access_token"), issued_at=time.time())
 
 
 @codex.command(short_help="Delete plugin auth locally; no HTTP API request.")
@@ -1760,6 +1799,13 @@ def status():
     except BorrowKeyError as e:
         click.echo(str(e))
         return
+    # Refresh like any token user, but still show the stored state on failure.
+    old_access_token = auth.tokens.get("access_token")
+    refresh_error = None
+    try:
+        _valid_auth_tokens(auth)
+    except BorrowKeyError as e:
+        refresh_error = e
     tokens = auth.tokens
     click.echo(f"Auth source: {auth.label}")
     click.echo(f"Auth file: {auth.path}")
@@ -1778,6 +1824,13 @@ def status():
     click.echo(f"refreshable: {'yes' if refreshable else 'no'}")
     click.echo(f"access_token: {_redact(tokens.get('access_token'))}")
     click.echo(f"access_token exp: {_exp_status(tokens.get('access_token'))}")
+    lifetime = _token_lifetime(tokens.get("access_token"))
+    lifetime_text = f"{lifetime / 3600:.1f} hours" if lifetime else "unknown"
+    click.echo(f"access_token lifetime: {lifetime_text}")
+    if tokens.get("access_token") != old_access_token:
+        click.echo(f"Refreshed Codex auth at {auth.path}")
+    if refresh_error:
+        click.echo(str(refresh_error))
     # id_token exp intentionally not shown: id_token is OIDC identity-only
     # (consumed at sign-in for profile claims, never sent to APIs). Its
     # useful claims surface in the `Account:` line above.

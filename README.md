@@ -68,7 +68,7 @@ SCP imports deliberately discard the remote refresh token and store only a non-r
 
 Repeating an SCP import can safely replace existing plugin auth without a logout only when the existing auth has no refresh token and has a decodable, expired access-token expiry. This check happens before `scp` runs. Otherwise the command identifies the existing auth file and asks you to inspect it with `llm codex status`; remove it with `llm codex logout` only when replacement is intended. A failed SCP transfer or invalid download leaves the existing snapshot untouched. If plugin auth changes while the transfer is running, installation is aborted rather than overwriting the newer auth.
 
-OAuth login, local imports, and borrowed Codex CLI auth refresh when a token nears expiry and with `llm codex refresh`. Refreshing rotates the refresh token. In borrowed mode this modifies the file shared with Codex CLI and can briefly disrupt a simultaneous CLI session; the plugin prints a warning. `llm codex status` shows the active source and `refreshable: yes/no`.
+OAuth login, local imports, and borrowed Codex CLI auth refresh automatically when the access token expires within 2 hours and a command needs it (prompts, `llm codex status`, `llm codex usage`), and on demand with `llm codex refresh`. A token issued with a lifetime of less than 4 hours (twice the window) refreshes at half its lifetime instead, so it cannot cause a refresh on every call; `login`, `refresh` and a local `import` print a warning for such a token. For an import, only the token's `iat` claim gives its issued lifetime, so an old token with little time left causes no warning. `llm codex status` shows `access_token lifetime`. Refreshing rotates the refresh token. In borrowed mode this modifies the file shared with Codex CLI and can briefly disrupt a simultaneous CLI session; the plugin prints a warning. `llm codex status` shows the active source and `refreshable: yes/no`.
 
 `llm codex logout` only deletes the local plugin-owned auth file, making Codex CLI auth the fallback again. It does not contact an API, revoke a token, or alter a remote machine, and routine re-import of an expired SCP snapshot does not require it.
 
@@ -80,7 +80,7 @@ llm codex import                 # copy Codex CLI auth into plugin-owned auth
 llm codex import --path PATH     # copy an explicit local auth file
 llm codex import --path HOST:    # SCP HOST:~/.codex/auth.json as a snapshot
 llm codex --version              # show the plugin version
-llm codex status                 # show the version, active source and refreshability
+llm codex status                 # show the version, active source and refreshability; refreshes a token near expiry
 llm codex refresh                # refresh the active source
 llm codex usage                  # show current Codex plan usage
 llm codex logout                 # delete local plugin-owned auth only
@@ -94,7 +94,7 @@ List available models:
 llm models -q codex
 ```
 
-Models are discovered from the Codex API and combined with known hidden/fallback slugs. Availability depends on your plan; a listed fallback may still fail at request time. Discovery is cached for 24 hours in `codex_models.json` in LLM's user config directory; delete it to force a re-fetch.
+Models are discovered from the Codex API and combined with known hidden/fallback slugs. Availability depends on your plan; a listed fallback may still fail at request time. Discovery is cached for 24 hours in `codex_models.json` in LLM's user config directory; delete it to force a re-fetch. Discovery never refreshes the token, because it runs in every `llm` process that loads models; with an expired token it uses the cache until a command such as a prompt refreshes the token.
 
 `codex/gpt-6-astra` is included as a fallback, so it is available for selection
 even when the cached discovery list does not include it. Access depends on your
